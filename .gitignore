@@ -1,0 +1,15 @@
+data/
+dataset_extracted/
+*.tar.gz
+*.gz
+pretrained/
+experiments/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+.DS_Store
+wandb/
+*.zip
+generated_images/
+submission.csv

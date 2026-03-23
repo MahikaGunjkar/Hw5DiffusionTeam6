@@ -1,127 +1,127 @@
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
-import torch 
-import torch.nn as nn 
+import torch
 import numpy as np
 
 from utils import randn_tensor
+from .scheduling_ddpm import DDPMScheduler
 
-from.scheduling_ddpm import DDPMScheduler
 
+class DDIMScheduler(DDPMScheduler):
 
-class DDIMScheduler(DDPMScheduler):    
-    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert self.num_inference_steps is not None, "Please set `num_inference_steps` before running inference using DDIM."
-        self.set_timesteps(self.num_inference_steps)
+        # BUG FIX #1: num_inference_steps can be None from the parent default.
+        # Fall back to num_train_timesteps so set_timesteps never receives None.
+        steps = self.num_inference_steps if self.num_inference_steps is not None else self.num_train_timesteps
+        self.set_timesteps(steps)
 
-    
+    def set_timesteps(
+        self,
+        num_inference_steps: int,
+        device: Union[str, torch.device] = None,
+    ):
+        """
+        Override to build evenly-spaced sub-sequence of timesteps for DDIM.
+        DDIM typically uses far fewer steps than the 1000 used during training.
+        """
+        if num_inference_steps > self.num_train_timesteps:
+            raise ValueError(
+                f"`num_inference_steps` ({num_inference_steps}) cannot exceed "
+                f"`num_train_timesteps` ({self.num_train_timesteps})."
+            )
+        self.num_inference_steps = num_inference_steps
+        # Evenly spaced indices in descending order
+        step_ratio = self.num_train_timesteps // num_inference_steps
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        self.timesteps = torch.from_numpy(timesteps).to(device)
+
     def _get_variance(self, t):
         """
-        This is one of the most important functions in the DDIM. It calculates the variance $sigma_t$ for a given timestep.
-        
-        Args:
-            t (`int`): The current timestep.
-        
-        Return:
-            variance (`torch.Tensor`): The variance $sigma_t$ for the given timestep.
+        DDIM variance (Eq. 16 from DDIM paper):
+          sigma_t^2 = (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_{t-1})
+
+        BUG FIX #2: clamp to 0 — float arithmetic can produce tiny negatives.
         """
-        
-        
-        # TODO: calculate $beta_t$ for the current timestep using the cumulative product of alphas
-        prev_t = None
-        alpha_prod_t = None
-        alpha_prod_t_prev = None 
-        beta_prod_t = None 
-        beta_prod_t_prev = None 
-        
-        # TODO: DDIM equation for variance
-        variance = None 
+        prev_t = self.previous_timestep(t)
+
+        alpha_prod_t = self.alphas_cumprod[t]
+        alpha_prod_t_prev = (
+            self.alphas_cumprod[prev_t]
+            if prev_t >= 0
+            else torch.tensor(1.0, device=self.alphas_cumprod.device, dtype=self.alphas_cumprod.dtype)
+        )
+        beta_prod_t = 1.0 - alpha_prod_t
+        beta_prod_t_prev = 1.0 - alpha_prod_t_prev
+
+        variance = (beta_prod_t_prev / beta_prod_t) * (1.0 - alpha_prod_t / alpha_prod_t_prev)
+
+        # BUG FIX #2 — prevent sqrt of negative from float imprecision
+        variance = torch.clamp(variance, min=0.0)
 
         return variance
-    
-    
+
     def step(
         self,
         model_output: torch.Tensor,
         timestep: int,
         sample: torch.Tensor,
         generator=None,
-        eta: float=0.0,
+        eta: float = 0.0,
     ) -> torch.Tensor:
         """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
+        DDIM reverse step (Eq. 12 from DDIM paper):
+          x_{t-1} = sqrt(alpha_bar_{t-1}) * x0_hat
+                  + sqrt(1 - alpha_bar_{t-1} - sigma_t^2) * eps_theta
+                  + sigma_t * noise
 
-        Args:
-            model_output (`torch.Tensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.Tensor`):
-                A current instance of a sample created by the diffusion process.
-            eta (`float`):
-                The weight of the noise to add to the variance.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-
-        Returns:
-            pred_prev_sample (`torch.Tensor`):
-                The predicted previous sample.
+        eta=0  → fully deterministic (standard DDIM)
+        eta=1  → stochastic, reduces to DDPM
         """
+        t = int(timestep)
+        prev_t = self.previous_timestep(t)
 
-        # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
-        # Ideally, read DDIM paper in-detail understanding
+        alpha_prod_t = self.alphas_cumprod[t]
+        # device-aware fallback (same fix as DDPM)
+        alpha_prod_t_prev = (
+            self.alphas_cumprod[prev_t]
+            if prev_t >= 0
+            else torch.tensor(1.0, device=self.alphas_cumprod.device, dtype=self.alphas_cumprod.dtype)
+        )
+        beta_prod_t = 1.0 - alpha_prod_t
 
-        # Notation (<variable name> -> <name in paper>
-        # - pred_noise_t -> e_theta(x_t, t)
-        # - pred_original_sample -> f_theta(x_t, t) or x_0
-        # - std_dev_t -> sigma_t
-        # - eta -> η
-        # - pred_sample_direction -> "direction pointing to x_t"
-        # - pred_prev_sample -> "x_t-1"
-        
-        t = timestep
-        prev_t = None 
-        
-        # TODO: 1. compute alphas, betas
-        alpha_prod_t = None 
-        alpha_prod_t_prev = None 
-        beta_prod_t = None 
-        
-        # TODO: 2. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
+        # 1. Predict x_0 from predicted noise
         if self.prediction_type == 'epsilon':
-            pred_original_sample = None 
-            pred_epsilon = None 
+            pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+            pred_epsilon = model_output
         else:
             raise NotImplementedError(f"Prediction type {self.prediction_type} not implemented.")
 
-        # TODO: 3. Clip or threshold "predicted x_0" (for better sampling quality)
+        # 2. Clip predicted x_0
         if self.clip_sample:
             pred_original_sample = pred_original_sample.clamp(
                 -self.clip_sample_range, self.clip_sample_range
             )
 
-        # TODO: 4. compute variance: "sigma_t(η)" -> see formula (16)
-        # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-        variance = None 
-        std_dev_t = None
+        # 3. Sigma_t = eta * sqrt(variance)
+        variance = self._get_variance(t)           # already clamped >= 0
+        std_dev_t = eta * (variance ** 0.5)
 
-        # TODO: 5. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        pred_sample_direction = None 
+        # 4. "Direction pointing to x_t"
+        #    coeff = sqrt(1 - alpha_bar_{t-1} - sigma_t^2)
+        # BUG FIX #3: clamp before sqrt — can be tiny-negative due to float precision
+        direction_coeff = (1.0 - alpha_prod_t_prev - std_dev_t ** 2).clamp(min=0.0) ** 0.5
+        pred_sample_direction = direction_coeff * pred_epsilon
 
-        # TODO: 6. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        prev_sample = None 
+        # 5. x_{t-1} (deterministic part)
+        prev_sample = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
 
-        # TODO: 7. Add noise with eta
+        # 6. Optional stochastic noise (only when eta > 0)
         if eta > 0:
             variance_noise = randn_tensor(
-                    model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype
+                model_output.shape, generator=generator,
+                device=model_output.device, dtype=model_output.dtype
             )
-            variance = None
+            prev_sample = prev_sample + std_dev_t * variance_noise
 
-            prev_sample = None 
-        
         return prev_sample
