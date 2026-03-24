@@ -2,14 +2,35 @@ import os
 import sys
 import torch
 
-# ── Patch torch.load for PyTorch 2.6 compatibility ──────────────────────────
-# PyTorch 2.6 changed weights_only default to True, which breaks checkpoints
-# containing ruamel.yaml objects. This patches torch.load before
-# utils/checkpoint.py ever calls it, so no prof files need changing.
+# ── Patch 1: Fix torch.load for PyTorch 2.6 ─────────────────────────────────
 _real_load = torch.load
 def _load_patch(f, map_location=None, pickle_module=None, weights_only=None, **kwargs):
     return _real_load(f, map_location=map_location, weights_only=False, **kwargs)
 torch.load = _load_patch
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Patch 2: Fix scheduler size mismatch ────────────────────────────────────
+# The checkpoint saves timesteps with shape [200] (num_inference_steps) but
+# the freshly built scheduler has shape [1000] (num_train_timesteps).
+# We skip loading the scheduler state entirely — it is fully rebuilt from args.
+from utils import checkpoint as _ckpt_module
+
+def _patched_load(unet, scheduler, vae=None, class_embedder=None,
+                  optimizer=None, checkpoint_path=None):
+    print("loading checkpoint")
+    ckpt = torch.load(checkpoint_path, weights_only=False)
+    print("loading unet")
+    unet.load_state_dict(ckpt['unet_state_dict'])
+    print("skipping scheduler (rebuilt from args)")
+    # scheduler.load_state_dict intentionally skipped — timesteps shape mismatch
+    if vae is not None and 'vae_state_dict' in ckpt:
+        print("loading vae")
+        vae.load_state_dict(ckpt['vae_state_dict'])
+    if class_embedder is not None and 'class_embedder_state_dict' in ckpt:
+        print("loading class_embedder")
+        class_embedder.load_state_dict(ckpt['class_embedder_state_dict'])
+
+_ckpt_module.load_checkpoint = _patched_load
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
@@ -36,20 +57,15 @@ logger = get_logger(__name__)
 
 
 def main():
-    # parse arguments
     args = parse_args()
 
-    # setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
 
-    # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # seed everything
     seed_everything(args.seed)
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
@@ -57,7 +73,6 @@ def main():
     # ===================== Model Setup =====================
     logger.info("Creating model")
 
-    # UNet
     unet = UNet(
         input_size=args.unet_in_size,
         input_ch=args.unet_in_ch,
@@ -73,23 +88,20 @@ def main():
     num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     logger.info(f"UNet parameters: {num_params / 10 ** 6:.2f}M")
 
-    # VAE
     vae = None
     if args.latent_ddpm:
         vae = VAE()
         vae.init_from_ckpt('pretrained/model.ckpt')
         vae.eval()
 
-    # CFG class embedder
     class_embedder = None
     if args.use_cfg:
         class_embedder = ClassEmbedder(
             embed_dim=args.unet_ch,
             n_classes=args.num_classes,
-            cond_drop_rate=0.0,  # no dropout at inference
+            cond_drop_rate=0.0,
         )
 
-    # Scheduler
     if args.use_ddim:
         scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
@@ -115,7 +127,6 @@ def main():
             clip_sample_range=args.clip_sample_range,
         )
 
-    # Send to device
     unet = unet.to(device)
     scheduler = scheduler.to(device)
     if vae:
@@ -123,28 +134,26 @@ def main():
     if class_embedder:
         class_embedder = class_embedder.to(device)
 
-    # Load checkpoint
-    assert args.ckpt is not None, "Please provide a checkpoint path via --ckpt"
+    assert args.ckpt is not None, "Please provide --ckpt"
     load_checkpoint(
         unet, scheduler,
         vae=vae,
         class_embedder=class_embedder,
-        checkpoint_path=args.ckpt
+        checkpoint_path=args.ckpt,
     )
 
-    # Try to load EMA weights if they exist (better generation quality)
+    # Load EMA weights if available
     ema_ckpt_path = args.ckpt.replace('checkpoint_epoch_', 'ema_checkpoint_epoch_')
     if os.path.exists(ema_ckpt_path):
         logger.info(f"Loading EMA weights from {ema_ckpt_path}")
-        ema_data = torch.load(ema_ckpt_path, map_location=device)
+        ema_data = torch.load(ema_ckpt_path, weights_only=False)
         for name, param in unet.named_parameters():
             if name in ema_data.get('ema_shadow', {}):
                 param.data.copy_(ema_data['ema_shadow'][name].to(device))
-        logger.info("EMA weights loaded successfully")
+        logger.info("EMA weights loaded")
 
     unet.eval()
 
-    # Pipeline
     pipeline = DDPMPipeline(
         unet=unet,
         scheduler=scheduler,
@@ -161,7 +170,6 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     if args.use_cfg:
-        # Generate 50 images per class = 5000 total
         for cls_idx in tqdm(range(args.num_classes), desc="Generating per class"):
             batch_size = 50
             classes = torch.full((batch_size,), cls_idx, dtype=torch.long, device=device)
@@ -177,7 +185,6 @@ def main():
             for i, img in enumerate(gen_images):
                 img.save(os.path.join(save_dir, f'class{cls_idx:03d}_img{i:02d}.png'))
     else:
-        # Generate 5000 unconditional images
         batch_size = 50
         num_batches = 5000 // batch_size
         for batch_idx in tqdm(range(num_batches), desc="Generating"):
@@ -197,15 +204,13 @@ def main():
     # ===================== FID & IS =====================
     logger.info("Computing FID and IS...")
 
-    # Convert PIL -> uint8 tensor (N, 3, H, W)
     all_tensors = []
     for img in all_images:
-        t = transforms.ToTensor()(img)       # float [0,1]
+        t = transforms.ToTensor()(img)
         t = (t * 255).to(torch.uint8)
         all_tensors.append(t)
-    gen_tensor = torch.stack(all_tensors)    # (5000, 3, H, W)
+    gen_tensor = torch.stack(all_tensors)
 
-    # Load reference images
     logger.info("Loading reference images...")
     ref_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
@@ -222,28 +227,20 @@ def main():
         ref_tensors.append(imgs)
     ref_tensor = torch.cat(ref_tensors, dim=0)
 
-    # ---- FID ----
+    # FID
     from torchmetrics.image.fid import FrechetInceptionDistance
     fid_metric = FrechetInceptionDistance(feature=2048).to(device)
-
-    logger.info("FID: processing real images...")
     for i in tqdm(range(0, ref_tensor.shape[0], 64), desc="FID real"):
         fid_metric.update(ref_tensor[i:i+64].to(device), real=True)
-
-    logger.info("FID: processing generated images...")
     for i in tqdm(range(0, gen_tensor.shape[0], 64), desc="FID fake"):
         fid_metric.update(gen_tensor[i:i+64].to(device), real=False)
-
     fid_score = fid_metric.compute().item()
 
-    # ---- IS ----
+    # IS
     from torchmetrics.image.inception import InceptionScore
     is_metric = InceptionScore().to(device)
-
-    logger.info("IS: processing generated images...")
     for i in tqdm(range(0, gen_tensor.shape[0], 64), desc="IS"):
         is_metric.update(gen_tensor[i:i+64].to(device))
-
     is_mean, is_std = is_metric.compute()
 
     logger.info("=" * 50)
@@ -251,18 +248,13 @@ def main():
     logger.info(f"  IS   = {is_mean:.4f} +/- {is_std:.4f}")
     logger.info("=" * 50)
 
-    # ===================== Kaggle Submission =====================
+    # Kaggle submission
     logger.info("Generating Kaggle submission CSV...")
     from generate_submission import generate_submission_from_tensors
-
     gen_float = gen_tensor.float() / 255.0
     submission_csv = os.path.join(args.output_dir, 'submission.csv')
-    generate_submission_from_tensors(
-        gen_float,
-        output_csv=submission_csv,
-        device=str(device),
-    )
-    logger.info(f"Submission CSV saved -> {submission_csv}")
+    generate_submission_from_tensors(gen_float, output_csv=submission_csv, device=str(device))
+    logger.info(f"Submission CSV -> {submission_csv}")
 
 
 if __name__ == '__main__':
