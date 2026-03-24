@@ -2,35 +2,11 @@ import os
 import sys
 import torch
 
-# ── Patch 1: Fix torch.load for PyTorch 2.6 ─────────────────────────────────
+# ── Patch torch.load for PyTorch 2.6 compatibility ──────────────────────────
 _real_load = torch.load
 def _load_patch(f, map_location=None, pickle_module=None, weights_only=None, **kwargs):
     return _real_load(f, map_location=map_location, weights_only=False, **kwargs)
 torch.load = _load_patch
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Patch 2: Fix scheduler size mismatch ────────────────────────────────────
-# The checkpoint saves timesteps with shape [200] (num_inference_steps) but
-# the freshly built scheduler has shape [1000] (num_train_timesteps).
-# We skip loading the scheduler state entirely — it is fully rebuilt from args.
-from utils import checkpoint as _ckpt_module
-
-def _patched_load(unet, scheduler, vae=None, class_embedder=None,
-                  optimizer=None, checkpoint_path=None):
-    print("loading checkpoint")
-    ckpt = torch.load(checkpoint_path, weights_only=False)
-    print("loading unet")
-    unet.load_state_dict(ckpt['unet_state_dict'])
-    print("skipping scheduler (rebuilt from args)")
-    # scheduler.load_state_dict intentionally skipped — timesteps shape mismatch
-    if vae is not None and 'vae_state_dict' in ckpt:
-        print("loading vae")
-        vae.load_state_dict(ckpt['vae_state_dict'])
-    if class_embedder is not None and 'class_embedder_state_dict' in ckpt:
-        print("loading class_embedder")
-        class_embedder.load_state_dict(ckpt['class_embedder_state_dict'])
-
-_ckpt_module.load_checkpoint = _patched_load
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
@@ -57,15 +33,20 @@ logger = get_logger(__name__)
 
 
 def main():
+    # parse arguments
     args = parse_args()
 
+    # setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
 
+    # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # seed everything
     seed_everything(args.seed)
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
@@ -73,6 +54,7 @@ def main():
     # ===================== Model Setup =====================
     logger.info("Creating model")
 
+    # UNet
     unet = UNet(
         input_size=args.unet_in_size,
         input_ch=args.unet_in_ch,
@@ -88,12 +70,14 @@ def main():
     num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     logger.info(f"UNet parameters: {num_params / 10 ** 6:.2f}M")
 
+    # VAE
     vae = None
     if args.latent_ddpm:
         vae = VAE()
         vae.init_from_ckpt('pretrained/model.ckpt')
         vae.eval()
 
+    # CFG class embedder
     class_embedder = None
     if args.use_cfg:
         class_embedder = ClassEmbedder(
@@ -102,6 +86,7 @@ def main():
             cond_drop_rate=0.0,
         )
 
+    # Scheduler
     if args.use_ddim:
         scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
@@ -127,6 +112,7 @@ def main():
             clip_sample_range=args.clip_sample_range,
         )
 
+    # Send to device
     unet = unet.to(device)
     scheduler = scheduler.to(device)
     if vae:
@@ -134,13 +120,21 @@ def main():
     if class_embedder:
         class_embedder = class_embedder.to(device)
 
+    # Load checkpoint — uses patched load_checkpoint (skips scheduler state)
     assert args.ckpt is not None, "Please provide --ckpt"
-    load_checkpoint(
-        unet, scheduler,
-        vae=vae,
-        class_embedder=class_embedder,
-        checkpoint_path=args.ckpt,
-    )
+
+    # Inline load to avoid scheduler size mismatch
+    print("loading checkpoint")
+    ckpt = torch.load(args.ckpt, weights_only=False)
+    print("loading unet")
+    unet.load_state_dict(ckpt['unet_state_dict'])
+    print("skipping scheduler (rebuilt from args)")
+    if vae is not None and 'vae_state_dict' in ckpt:
+        print("loading vae")
+        vae.load_state_dict(ckpt['vae_state_dict'])
+    if class_embedder is not None and 'class_embedder_state_dict' in ckpt:
+        print("loading class_embedder")
+        class_embedder.load_state_dict(ckpt['class_embedder_state_dict'])
 
     # Load EMA weights if available
     ema_ckpt_path = args.ckpt.replace('checkpoint_epoch_', 'ema_checkpoint_epoch_')
