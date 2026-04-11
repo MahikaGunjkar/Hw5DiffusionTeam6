@@ -165,10 +165,10 @@ def parse_args():
     parser.add_argument("--clip_sample_range", type=float, default=1.0)
 
     # ---- UNet ----
-    parser.add_argument("--unet_in_size", type=int, default=16,
-                        help="UNet input spatial size. Set to 16 when using VAE (latent DDPM).")
+    parser.add_argument("--unet_in_size", type=int, default=32,
+                        help="UNet input spatial size. Set to 128 when using DDPM. Set to 32 when using VAE (latent DDPM).")
     parser.add_argument("--unet_in_ch", type=int, default=4,
-                        help="UNet input channels. Set to 4 when using VAE.")
+                        help="UNet input channels.")
     parser.add_argument("--unet_ch", type=int, default=128)
     parser.add_argument("--unet_ch_mult", type=int, default=[1, 2, 2, 2], nargs='+')
     parser.add_argument("--unet_attn", type=int, default=[1, 2, 3], nargs='+')
@@ -176,7 +176,7 @@ def parse_args():
     parser.add_argument("--unet_dropout", type=float, default=0.0)
 
     # ---- VAE ----
-    parser.add_argument("--latent_ddpm", type=str2bool, default=True,
+    parser.add_argument("--latent_ddpm", type=str2bool, default=False,
                         help="Use VAE for latent DDPM. Also set unet_in_size=16, unet_in_ch=4.")
 
     # ---- CFG ----
