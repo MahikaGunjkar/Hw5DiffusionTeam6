@@ -176,7 +176,7 @@ def parse_args():
     parser.add_argument("--unet_dropout", type=float, default=0.0)
 
     # ---- VAE ----
-    parser.add_argument("--latent_ddpm", type=str2bool, default=False,
+    parser.add_argument("--latent_ddpm", type=str2bool, default=True,
                         help="Use VAE for latent DDPM. Also set unet_in_size=32, unet_in_ch=3.")
 
     # ---- CFG ----
