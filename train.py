@@ -166,8 +166,8 @@ def parse_args():
 
     # ---- UNet ----
     parser.add_argument("--unet_in_size", type=int, default=32,
-                        help="UNet input spatial size. Set to 128 when using DDPM. Set to 32 when using VAE (latent DDPM).")
-    parser.add_argument("--unet_in_ch", type=int, default=4,
+                        help="UNet input spatial size. Set to 128 for standard DDPM, 32 for latent DDPM.")
+    parser.add_argument("--unet_in_ch", type=int, default=3,
                         help="UNet input channels.")
     parser.add_argument("--unet_ch", type=int, default=128)
     parser.add_argument("--unet_ch_mult", type=int, default=[1, 2, 2, 2], nargs='+')
@@ -177,7 +177,7 @@ def parse_args():
 
     # ---- VAE ----
     parser.add_argument("--latent_ddpm", type=str2bool, default=False,
-                        help="Use VAE for latent DDPM. Also set unet_in_size=16, unet_in_ch=4.")
+                        help="Use VAE for latent DDPM. Also set unet_in_size=32, unet_in_ch=3.")
 
     # ---- CFG ----
     parser.add_argument("--use_cfg", type=str2bool, default=False)
@@ -298,11 +298,11 @@ def main():
     logger.info("Creating model")
 
     # BUG FIX #9 reminder (enforced here with a clear error):
-    if args.latent_ddpm and (args.unet_in_size == 128 or args.unet_in_ch == 3):
+    if args.latent_ddpm and args.unet_in_size == 128:
         logger.warning(
-            "latent_ddpm=True but unet_in_size=%d and unet_in_ch=%d. "
-            "You probably want unet_in_size=16 and unet_in_ch=4 in your config.",
-            args.unet_in_size, args.unet_in_ch
+            "latent_ddpm=True but unet_in_size=%d. "
+            "You probably want unet_in_size=32 and unet_in_ch=3 for this VAE.",
+            args.unet_in_size
         )
 
     unet = UNet(
