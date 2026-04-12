@@ -166,9 +166,9 @@ def parse_args():
 
     # ---- UNet ----
     parser.add_argument("--unet_in_size", type=int, default=128,
-                        help="UNet input spatial size. Set to 16 when using VAE (latent DDPM).")
+                        help="UNet input spatial size. Auto-set to 32 when latent_ddpm is enabled.")
     parser.add_argument("--unet_in_ch", type=int, default=3,
-                        help="UNet input channels. Set to 4 when using VAE.")
+                        help="UNet input channels.")
     parser.add_argument("--unet_ch", type=int, default=128)
     parser.add_argument("--unet_ch_mult", type=int, default=[1, 2, 2, 2], nargs='+')
     parser.add_argument("--unet_attn", type=int, default=[1, 2, 3], nargs='+')
@@ -176,8 +176,8 @@ def parse_args():
     parser.add_argument("--unet_dropout", type=float, default=0.0)
 
     # ---- VAE ----
-    parser.add_argument("--latent_ddpm", type=str2bool, default=False,
-                        help="Use VAE for latent DDPM. Also set unet_in_size=16, unet_in_ch=4.")
+    parser.add_argument("--latent_ddpm", type=str2bool, default=True,
+                        help="Use VAE for latent DDPM. Automatically sets unet_in_size=32, unet_in_ch=3.")
 
     # ---- CFG ----
     parser.add_argument("--use_cfg", type=str2bool, default=False)
@@ -201,6 +201,12 @@ def parse_args():
 
     # Re-parse — command-line overrides YAML
     args = parser.parse_args()
+
+    # Auto-override UNet config when using latent DDPM
+    if args.latent_ddpm:
+        args.unet_in_size = 32
+        args.unet_in_ch = 3
+
     return args
 
 
@@ -297,14 +303,6 @@ def main():
     # ===================== Model Setup =====================
     logger.info("Creating model")
 
-    # BUG FIX #9 reminder (enforced here with a clear error):
-    if args.latent_ddpm and (args.unet_in_size == 128 or args.unet_in_ch == 3):
-        logger.warning(
-            "latent_ddpm=True but unet_in_size=%d and unet_in_ch=%d. "
-            "You probably want unet_in_size=16 and unet_in_ch=4 in your config.",
-            args.unet_in_size, args.unet_in_ch
-        )
-
     unet = UNet(
         input_size=args.unet_in_size,
         input_ch=args.unet_in_ch,
@@ -355,7 +353,7 @@ def main():
 
     # ===================== Optimizer =====================
     params = list(unet.parameters())
-    if class_embedder is not None:
+    if class_embedder:
         params += list(class_embedder.parameters())
 
     optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -442,7 +440,7 @@ def main():
 
         loss_m = AverageMeter()
         unet.train()
-        if class_embedder is not None:
+        if class_embedder:
             class_embedder.train()
 
         for step, (images, labels) in enumerate(train_loader):
@@ -451,7 +449,7 @@ def main():
             labels = labels.to(device)
 
             # Latent DDPM — encode with frozen VAE
-            if vae is not None:
+            if vae:
                 with torch.no_grad():
                     images = vae.encode(images)
                 images = images * 0.1845   # scale to ~unit std

@@ -2,6 +2,10 @@ data/
 dataset_extracted/
 *.tar.gz
 *.gz
+.vscode/
+.cursor/
+AGENTS.md
+CLAUDE.md
 pretrained/
 experiments/
 __pycache__/
