@@ -1,0 +1,13 @@
+# Exp 16 — RF (no OT) on UNet (isolated RF contribution)
+slurm:
+  node: v100-32
+  gpus: 4
+  time: "08:00:00"
+
+framework: flow_matching
+use_cfg: true
+model_type: unet
+num_epochs: 50
+batch_size: 32
+learning_rate: 0.0001
+use_ot: false

@@ -1,0 +1,12 @@
+# Exp 19 — DDPM baseline (original recipe)
+slurm:
+  node: v100-32
+  gpus: 4
+  time: "06:00:00"
+
+use_cfg: true
+framework: ddpm
+model_type: unet
+num_epochs: 50
+batch_size: 32
+learning_rate: 0.0001

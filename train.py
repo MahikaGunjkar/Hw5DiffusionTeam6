@@ -16,9 +16,9 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 
-from models import UNet, VAE, ClassEmbedder
-from schedulers import DDPMScheduler, DDIMScheduler
-from pipelines import DDPMPipeline
+from models import UNet, VAE, ClassEmbedder, build_dit
+from schedulers import DDPMScheduler, DDIMScheduler, RectifiedFlowScheduler
+from pipelines import DDPMPipeline, FlowMatchingPipeline
 from utils import seed_everything, init_distributed_device, is_primary, AverageMeter, str2bool, save_checkpoint
 
 logger = get_logger(__name__)
@@ -123,9 +123,10 @@ class EMA:
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a DDPM model.")
 
-    # config file
-    parser.add_argument("--config", type=str, default='configs/ddpm.yaml',
-                        help="YAML config file")
+    # config file(s) — later files override earlier ones, so an ablation
+    # YAML can ship only the deltas from the base config.
+    parser.add_argument("--config", type=str, nargs='+', default=['configs/ddpm.yaml'],
+                        help="One or more YAML config files; later override earlier.")
 
     # ---- Dataset ----
     # BUG FIX #8 / new feature: use a tar path instead of a pre-extracted data_dir
@@ -175,6 +176,28 @@ def parse_args():
     parser.add_argument("--unet_num_res_blocks", type=int, default=2)
     parser.add_argument("--unet_dropout", type=float, default=0.0)
 
+    # ---- Advanced: OT-AdaMask Flow framework flags ----
+    parser.add_argument("--framework", type=str, default='ddpm',
+                        choices=['ddpm', 'flow_matching'],
+                        help="Training framework. 'ddpm' (baseline) or 'flow_matching' (Rectified Flow).")
+    parser.add_argument("--model_type", type=str, default='unet',
+                        choices=['unet', 'dit_s', 'dit_b', 'dit_l', 'dit_xl'],
+                        help="Denoising network architecture.")
+    parser.add_argument("--use_ot", type=str2bool, default=False,
+                        help="Minibatch OT pairing (flow_matching only).")
+    parser.add_argument("--ot_max_batch", type=int, default=64,
+                        help="Max batch size for Hungarian OT before requiring Sinkhorn.")
+    parser.add_argument("--use_ada_mask", type=str2bool, default=False,
+                        help="Time-adaptive random patch masking (DiT only).")
+    parser.add_argument("--ada_mask_max", type=float, default=0.75,
+                        help="Maximum AdaMask drop ratio at t=0.")
+    parser.add_argument("--const_mask_ratio", type=float, default=None,
+                        help="If set, override AdaMask schedule with a constant ratio.")
+    parser.add_argument("--dit_patch_size", type=int, default=2)
+    parser.add_argument("--dit_decoder_depth", type=int, default=2)
+    parser.add_argument("--flow_solver", type=str, default='euler', choices=['euler', 'heun'])
+    parser.add_argument("--num_inference_steps_flow", type=int, default=10)
+
     # ---- VAE ----
     parser.add_argument("--latent_ddpm", type=str2bool, default=True,
                         help="Use VAE for latent DDPM. Automatically sets unet_in_size=32, unet_in_ch=3.")
@@ -193,11 +216,16 @@ def parse_args():
     args = parser.parse_args()
 
     # Load YAML config and set as new defaults
-    if args.config is not None:
-        with open(args.config, 'r', encoding='utf-8') as f:
-            file_yaml = yaml.YAML()
-            config_args = file_yaml.load(f)
-            parser.set_defaults(**config_args)
+    if args.config:
+        merged = {}
+        file_yaml = yaml.YAML()
+        for cfg_path in args.config:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = file_yaml.load(f) or {}
+            # Strip the `slurm:` block — it is only for scripts/submit.sh.
+            cfg.pop('slurm', None)
+            merged.update(cfg)
+        parser.set_defaults(**merged)
 
     # Re-parse — command-line overrides YAML
     args = parser.parse_args()
@@ -301,34 +329,64 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
 
     # ===================== Model Setup =====================
-    logger.info("Creating model")
+    logger.info(f"Creating model: framework={args.framework}, model_type={args.model_type}")
 
-    unet = UNet(
-        input_size=args.unet_in_size,
-        input_ch=args.unet_in_ch,
-        T=args.num_train_timesteps,
-        ch=args.unet_ch,
-        ch_mult=args.unet_ch_mult,
-        attn=args.unet_attn,
-        num_res_blocks=args.unet_num_res_blocks,
-        dropout=args.unet_dropout,
-        conditional=args.use_cfg,
-        c_dim=args.unet_ch,
-    )
+    # Class-conditioning dimension depends on architecture
+    _DIT_HIDDEN = {'dit_s': 384, 'dit_b': 768, 'dit_l': 1024, 'dit_xl': 1152}
+    if args.model_type == 'unet':
+        class_emb_dim = args.unet_ch
+    else:
+        class_emb_dim = _DIT_HIDDEN[args.model_type]
+
+    if args.model_type == 'unet':
+        unet = UNet(
+            input_size=args.unet_in_size,
+            input_ch=args.unet_in_ch,
+            T=args.num_train_timesteps,
+            ch=args.unet_ch,
+            ch_mult=args.unet_ch_mult,
+            attn=args.unet_attn,
+            num_res_blocks=args.unet_num_res_blocks,
+            dropout=args.unet_dropout,
+            conditional=args.use_cfg,
+            c_dim=args.unet_ch,
+        )
+    else:
+        unet = build_dit(
+            preset=args.model_type,
+            input_size=args.unet_in_size,
+            patch_size=args.dit_patch_size,
+            in_channels=args.unet_in_ch,
+            c_dim=class_emb_dim if args.use_cfg else None,
+            use_ada_mask=args.use_ada_mask,
+            ada_mask_max=args.ada_mask_max,
+            const_mask_ratio=args.const_mask_ratio,
+            decoder_depth=args.dit_decoder_depth,
+            num_train_timesteps_ref=args.num_train_timesteps,
+        )
     num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    logger.info(f"UNet parameters: {num_params / 1e6:.2f}M")
+    logger.info(f"{args.model_type} parameters: {num_params / 1e6:.2f}M")
 
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=args.num_train_timesteps,
-        num_inference_steps=args.num_inference_steps,
-        beta_start=args.beta_start,
-        beta_end=args.beta_end,
-        beta_schedule=args.beta_schedule,
-        variance_type=args.variance_type,
-        prediction_type=args.prediction_type,
-        clip_sample=args.clip_sample,
-        clip_sample_range=args.clip_sample_range,
-    )
+    if args.framework == 'flow_matching':
+        noise_scheduler = RectifiedFlowScheduler(
+            num_train_timesteps=args.num_train_timesteps,
+            num_inference_steps=args.num_inference_steps_flow,
+            solver=args.flow_solver,
+            use_ot=args.use_ot,
+            ot_max_batch=args.ot_max_batch,
+        )
+    else:
+        noise_scheduler = DDPMScheduler(
+            num_train_timesteps=args.num_train_timesteps,
+            num_inference_steps=args.num_inference_steps,
+            beta_start=args.beta_start,
+            beta_end=args.beta_end,
+            beta_schedule=args.beta_schedule,
+            variance_type=args.variance_type,
+            prediction_type=args.prediction_type,
+            clip_sample=args.clip_sample,
+            clip_sample_range=args.clip_sample_range,
+        )
 
     vae = None
     if args.latent_ddpm:
@@ -339,7 +397,7 @@ def main():
     class_embedder = None
     if args.use_cfg:
         class_embedder = ClassEmbedder(
-            embed_dim=args.unet_ch,
+            embed_dim=class_emb_dim,
             n_classes=args.num_classes,
             cond_drop_rate=0.1,
         )
@@ -384,28 +442,37 @@ def main():
         class_embedder_wo_ddp = class_embedder
     vae_wo_ddp = vae
 
-    # Inference scheduler (DDIM or DDPM)
-    if args.use_ddim:
-        inference_scheduler = DDIMScheduler(
-            num_train_timesteps=args.num_train_timesteps,
-            num_inference_steps=args.num_inference_steps,
-            beta_start=args.beta_start,
-            beta_end=args.beta_end,
-            beta_schedule=args.beta_schedule,
-            variance_type=args.variance_type,
-            prediction_type=args.prediction_type,
-            clip_sample=args.clip_sample,
-            clip_sample_range=args.clip_sample_range,
-        ).to(device)
+    # Inference scheduler and pipeline selection
+    if args.framework == 'flow_matching':
+        inference_scheduler = noise_scheduler     # reuse the flow scheduler
+        pipeline = FlowMatchingPipeline(
+            unet=unet_wo_ddp,
+            scheduler=inference_scheduler,
+            vae=vae_wo_ddp,
+            class_embedder=class_embedder_wo_ddp,
+        )
     else:
-        inference_scheduler = noise_scheduler
+        if args.use_ddim:
+            inference_scheduler = DDIMScheduler(
+                num_train_timesteps=args.num_train_timesteps,
+                num_inference_steps=args.num_inference_steps,
+                beta_start=args.beta_start,
+                beta_end=args.beta_end,
+                beta_schedule=args.beta_schedule,
+                variance_type=args.variance_type,
+                prediction_type=args.prediction_type,
+                clip_sample=args.clip_sample,
+                clip_sample_range=args.clip_sample_range,
+            ).to(device)
+        else:
+            inference_scheduler = noise_scheduler
 
-    pipeline = DDPMPipeline(
-        unet=unet_wo_ddp,
-        scheduler=inference_scheduler,
-        vae=vae_wo_ddp,
-        class_embedder=class_embedder_wo_ddp,
-    )
+        pipeline = DDPMPipeline(
+            unet=unet_wo_ddp,
+            scheduler=inference_scheduler,
+            vae=vae_wo_ddp,
+            class_embedder=class_embedder_wo_ddp,
+        )
 
     # ===================== Config Dump =====================
     if is_primary(args):
@@ -459,20 +526,46 @@ def main():
             # CFG class embeddings (with 10 % unconditional dropout inside ClassEmbedder)
             class_emb = class_embedder(labels) if class_embedder is not None else None
 
-            # Forward diffusion
-            noise = torch.randn_like(images)
-            timesteps = torch.randint(0, args.num_train_timesteps, (batch_size,), device=device).long()
-            noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+            # ================= Forward + loss =================
+            if args.framework == 'flow_matching':
+                # Rectified Flow with optional OT pairing.
+                # Convention: t=0 -> noise, t=1 -> data; v* = x_1 - x_0.
+                x_1 = images                              # real latents
+                x_0 = torch.randn_like(images)            # pure Gaussian noise
+                x_0 = noise_scheduler.pair_ot(x_0, x_1)   # identity if use_ot=False
 
-            # UNet noise prediction
-            model_pred = unet(noisy_images, timesteps, c=class_emb)
+                t = torch.rand(batch_size, device=device)
+                x_t = noise_scheduler.interpolate(x_0, x_1, t)
+                target = noise_scheduler.velocity_target(x_0, x_1)
 
-            if args.prediction_type == 'epsilon':
-                target = noise
+                # UNet uses a discrete timestep embedding table; rescale
+                # continuous t -> integer index. DiT accepts continuous t.
+                if args.model_type == 'unet':
+                    t_in = (t * args.num_train_timesteps).long().clamp(
+                        0, args.num_train_timesteps - 1)
+                else:
+                    t_in = t
+
+                model_pred = unet(x_t, t_in, c=class_emb)
+                loss = F.mse_loss(model_pred, target)
             else:
-                raise NotImplementedError(f"prediction_type {args.prediction_type} not supported.")
+                # Standard DDPM epsilon-prediction baseline.
+                noise = torch.randn_like(images)
+                timesteps = torch.randint(
+                    0, args.num_train_timesteps, (batch_size,), device=device
+                ).long()
+                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
 
-            loss = F.mse_loss(model_pred, target)
+                model_pred = unet(noisy_images, timesteps, c=class_emb)
+
+                if args.prediction_type == 'epsilon':
+                    target = noise
+                else:
+                    raise NotImplementedError(
+                        f"prediction_type {args.prediction_type} not supported."
+                    )
+
+                loss = F.mse_loss(model_pred, target)
             loss_m.update(loss.item())
 
             loss.backward()
@@ -498,11 +591,17 @@ def main():
         generator = torch.Generator(device=device)
         generator.manual_seed(epoch + args.seed)
 
+        infer_steps = (
+            args.num_inference_steps_flow
+            if args.framework == 'flow_matching'
+            else args.num_inference_steps
+        )
+
         if args.use_cfg:
             classes = torch.randint(0, args.num_classes, (4,), device=device)
             gen_images = pipeline(
                 batch_size=4,
-                num_inference_steps=args.num_inference_steps,
+                num_inference_steps=infer_steps,
                 classes=classes.tolist(),
                 guidance_scale=args.cfg_guidance_scale,
                 generator=generator,
@@ -511,7 +610,7 @@ def main():
         else:
             gen_images = pipeline(
                 batch_size=4,
-                num_inference_steps=args.num_inference_steps,
+                num_inference_steps=infer_steps,
                 generator=generator,
                 device=device,
             )

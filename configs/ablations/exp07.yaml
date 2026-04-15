@@ -1,0 +1,15 @@
+# Exp 07 — AdaMask 90% (near-collapse boundary)
+slurm:
+  node: v100-32
+  gpus: 8
+  time: "36:00:00"
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_b
+use_ada_mask: true
+ada_mask_max: 0.9
+num_epochs: 300
+batch_size: 32
+learning_rate: 0.0003

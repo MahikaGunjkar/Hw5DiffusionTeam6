@@ -29,3 +29,21 @@ unet_dropout: 0.0
 latent_ddpm: true
 use_cfg: false
 use_ddim: true
+
+# ===== OT-AdaMask Flow (advanced techniques) =====
+# framework: 'ddpm' (baseline) | 'flow_matching' (Rectified Flow)
+framework: ddpm
+# model_type: 'unet' (baseline) | 'dit_s' | 'dit_b' | 'dit_l' | 'dit_xl'
+model_type: unet
+# use_ot: minibatch optimal-transport pairing (flow_matching only)
+use_ot: false
+ot_max_batch: 64
+# use_ada_mask: time-adaptive random patch masking (DiT only)
+use_ada_mask: false
+ada_mask_max: 0.75
+const_mask_ratio: null        # override ada schedule with a constant ratio
+dit_patch_size: 2
+dit_decoder_depth: 2
+# solver: 'euler' | 'heun' (flow_matching inference only)
+flow_solver: euler
+num_inference_steps_flow: 10

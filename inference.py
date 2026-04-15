@@ -22,9 +22,9 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 
-from models import UNet, VAE, ClassEmbedder
-from schedulers import DDPMScheduler, DDIMScheduler
-from pipelines import DDPMPipeline
+from models import UNet, VAE, ClassEmbedder, build_dit
+from schedulers import DDPMScheduler, DDIMScheduler, RectifiedFlowScheduler
+from pipelines import DDPMPipeline, FlowMatchingPipeline
 from utils import seed_everything, load_checkpoint
 
 from train import parse_args
@@ -52,23 +52,39 @@ def main():
     generator.manual_seed(args.seed)
 
     # ===================== Model Setup =====================
-    logger.info("Creating model")
+    logger.info(f"Creating model: framework={args.framework}, model_type={args.model_type}")
 
-    # UNet
-    unet = UNet(
-        input_size=args.unet_in_size,
-        input_ch=args.unet_in_ch,
-        T=args.num_train_timesteps,
-        ch=args.unet_ch,
-        ch_mult=args.unet_ch_mult,
-        attn=args.unet_attn,
-        num_res_blocks=args.unet_num_res_blocks,
-        dropout=args.unet_dropout,
-        conditional=args.use_cfg,
-        c_dim=args.unet_ch,
-    )
+    _DIT_HIDDEN = {'dit_s': 384, 'dit_b': 768, 'dit_l': 1024, 'dit_xl': 1152}
+    class_emb_dim = args.unet_ch if args.model_type == 'unet' else _DIT_HIDDEN[args.model_type]
+
+    if args.model_type == 'unet':
+        unet = UNet(
+            input_size=args.unet_in_size,
+            input_ch=args.unet_in_ch,
+            T=args.num_train_timesteps,
+            ch=args.unet_ch,
+            ch_mult=args.unet_ch_mult,
+            attn=args.unet_attn,
+            num_res_blocks=args.unet_num_res_blocks,
+            dropout=args.unet_dropout,
+            conditional=args.use_cfg,
+            c_dim=args.unet_ch,
+        )
+    else:
+        unet = build_dit(
+            preset=args.model_type,
+            input_size=args.unet_in_size,
+            patch_size=args.dit_patch_size,
+            in_channels=args.unet_in_ch,
+            c_dim=class_emb_dim if args.use_cfg else None,
+            use_ada_mask=False,   # inference: mask is always off
+            ada_mask_max=args.ada_mask_max,
+            const_mask_ratio=None,
+            decoder_depth=args.dit_decoder_depth,
+            num_train_timesteps_ref=args.num_train_timesteps,
+        )
     num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    logger.info(f"UNet parameters: {num_params / 10 ** 6:.2f}M")
+    logger.info(f"{args.model_type} parameters: {num_params / 10 ** 6:.2f}M")
 
     # VAE
     vae = None
@@ -81,13 +97,21 @@ def main():
     class_embedder = None
     if args.use_cfg:
         class_embedder = ClassEmbedder(
-            embed_dim=args.unet_ch,
+            embed_dim=class_emb_dim,
             n_classes=args.num_classes,
             cond_drop_rate=0.0,
         )
 
     # Scheduler
-    if args.use_ddim:
+    if args.framework == 'flow_matching':
+        scheduler = RectifiedFlowScheduler(
+            num_train_timesteps=args.num_train_timesteps,
+            num_inference_steps=args.num_inference_steps_flow,
+            solver=args.flow_solver,
+            use_ot=False,   # inference never uses OT
+            ot_max_batch=args.ot_max_batch,
+        )
+    elif args.use_ddim:
         scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
             num_inference_steps=args.num_inference_steps,
@@ -148,11 +172,18 @@ def main():
 
     unet.eval()
 
-    pipeline = DDPMPipeline(
+    PipelineCls = FlowMatchingPipeline if args.framework == 'flow_matching' else DDPMPipeline
+    pipeline = PipelineCls(
         unet=unet,
         scheduler=scheduler,
         vae=vae,
         class_embedder=class_embedder,
+    )
+
+    infer_steps = (
+        args.num_inference_steps_flow
+        if args.framework == 'flow_matching'
+        else args.num_inference_steps
     )
 
     # ===================== Generate Images =====================
@@ -169,7 +200,7 @@ def main():
             classes = torch.full((batch_size,), cls_idx, dtype=torch.long, device=device)
             gen_images = pipeline(
                 batch_size=batch_size,
-                num_inference_steps=args.num_inference_steps,
+                num_inference_steps=infer_steps,
                 classes=classes.tolist(),
                 guidance_scale=args.cfg_guidance_scale,
                 generator=generator,
@@ -184,7 +215,7 @@ def main():
         for batch_idx in tqdm(range(num_batches), desc="Generating"):
             gen_images = pipeline(
                 batch_size=batch_size,
-                num_inference_steps=args.num_inference_steps,
+                num_inference_steps=infer_steps,
                 generator=generator,
                 device=device,
             )

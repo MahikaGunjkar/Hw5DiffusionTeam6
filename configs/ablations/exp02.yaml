@@ -1,0 +1,15 @@
+# Exp 02 — DiT-L Scaling Law upper point
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "40:00:00"
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_l
+use_ada_mask: true
+ada_mask_max: 0.75
+num_epochs: 200
+batch_size: 24
+learning_rate: 0.0003

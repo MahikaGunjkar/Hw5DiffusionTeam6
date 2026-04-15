@@ -1,0 +1,16 @@
+# Exp 03 — DiT-B SOTA (main headline result)
+# Full OT-AdaMask stack, 300 epochs. This is the anchor of the scaling-law plot.
+slurm:
+  node: v100-32
+  gpus: 8
+  time: "48:00:00"
+
+framework: flow_matching
+model_type: dit_b
+use_ot: true
+use_ada_mask: true
+ada_mask_max: 0.75
+use_cfg: true
+num_epochs: 300
+batch_size: 32
+learning_rate: 3.0e-4

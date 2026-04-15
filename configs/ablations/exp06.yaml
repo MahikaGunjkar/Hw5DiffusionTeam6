@@ -1,0 +1,15 @@
+# Exp 06 — AdaMask 50% (more conservative schedule)
+slurm:
+  node: v100-32
+  gpus: 8
+  time: "48:00:00"
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_b
+use_ada_mask: true
+ada_mask_max: 0.5
+num_epochs: 300
+batch_size: 32
+learning_rate: 0.0003

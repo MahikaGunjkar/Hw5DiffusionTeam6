@@ -1,0 +1,14 @@
+# Exp 05 — Const 50% mask vs AdaMask schedule
+slurm:
+  node: v100-32
+  gpus: 8
+  time: "36:00:00"
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_b
+const_mask_ratio: 0.5
+num_epochs: 300
+batch_size: 32
+learning_rate: 0.0003
