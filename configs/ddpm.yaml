@@ -3,7 +3,9 @@ seed: 42
 data_dir: ./data
 image_size: 128
 batch_size: 32
-num_workers: 4
+num_workers: 8
+prefetch_factor: 4
+persistent_workers: true
 subset: 0.3
 num_classes: 100
 num_epochs: 50
@@ -11,6 +13,8 @@ learning_rate: 1e-4
 weight_decay: 1e-4
 grad_clip: 1.0
 mixed_precision: bf16
+compile_unet: true
+compile_mode: reduce-overhead
 num_train_timesteps: 1000
 num_inference_steps: 50
 beta_start: 0.0001
@@ -30,3 +34,4 @@ unet_dropout: 0.0
 latent_ddpm: true
 use_cfg: true
 use_ddim: true
+sample_every_epochs: 5

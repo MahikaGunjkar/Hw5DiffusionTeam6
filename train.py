@@ -3,6 +3,7 @@ import sys
 import copy
 import tarfile
 import argparse
+from contextlib import nullcontext
 import numpy as np
 import ruamel.yaml as yaml
 import torch
@@ -156,6 +157,10 @@ def parse_args():
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--prefetch_factor", type=int, default=2,
+                        help="Number of prefetch batches per worker.")
+    parser.add_argument("--persistent_workers", type=str2bool, default=True,
+                        help="Keep DataLoader workers alive across epochs.")
     parser.add_argument("--num_classes", type=int, default=100)
     parser.add_argument("--subset", type=float, default=1.0,
                         help="Fraction of training data to use (0 < subset <= 1).")
@@ -170,6 +175,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mixed_precision", type=str, default='none',
                         choices=['fp16', 'bf16', 'fp32', 'none'])
+    parser.add_argument("--compile_unet", type=str2bool, default=False,
+                        help="Use torch.compile on UNet (single-process only).")
+    parser.add_argument("--compile_mode", type=str, default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"])
 
     # ---- DDPM ----
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
@@ -203,6 +212,8 @@ def parse_args():
 
     # ---- DDIM ----
     parser.add_argument("--use_ddim", type=str2bool, default=False)
+    parser.add_argument("--sample_every_epochs", type=int, default=1,
+                        help="Run image sampling every N epochs.")
 
     # ---- Checkpoint (inference) ----
     parser.add_argument("--ckpt", type=str, default=None)
@@ -225,6 +236,9 @@ def parse_args():
     if args.latent_ddpm:
         args.unet_in_size = 32
         args.unet_in_ch = 3
+
+    if args.sample_every_epochs <= 0:
+        raise ValueError(f"--sample_every_epochs must be >= 1, got {args.sample_every_epochs}")
 
     return args
 
@@ -317,8 +331,7 @@ def main():
         sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
     shuffle = False if sampler else True
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+    loader_kwargs = dict(
         batch_size=args.batch_size,
         shuffle=shuffle,
         sampler=sampler,
@@ -326,6 +339,10 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = args.persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    train_loader = torch.utils.data.DataLoader(train_dataset, **loader_kwargs)
 
     total_batch_size = args.batch_size * args.world_size
     args.total_batch_size = total_batch_size
@@ -356,6 +373,18 @@ def main():
         conditional=args.use_cfg,
         c_dim=args.unet_ch,
     )
+    if args.compile_unet:
+        if args.distributed:
+            logger.warning("compile_unet=True is ignored in distributed mode.")
+        elif not hasattr(torch, "compile"):
+            logger.warning("torch.compile is unavailable in this PyTorch version.")
+        else:
+            logger.info(f"Compiling UNet with mode='{args.compile_mode}'")
+            if args.compile_mode in {"reduce-overhead", "max-autotune"}:
+                logger.warning(
+                    f"compile_mode='{args.compile_mode}' may have long first-step warmup."
+                )
+            unet = torch.compile(unet, mode=args.compile_mode)
     num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     logger.info(f"UNet parameters: {num_params / 1e6:.2f}M")
 
@@ -398,6 +427,14 @@ def main():
         params += list(class_embedder.parameters())
 
     optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    use_cuda_amp = torch.cuda.is_available() and str(device).startswith("cuda")
+    use_mixed = args.mixed_precision in {"fp16", "bf16"} and use_cuda_amp
+    amp_dtype = (
+        torch.float16 if args.mixed_precision == "fp16"
+        else torch.bfloat16 if args.mixed_precision == "bf16"
+        else None
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_mixed and args.mixed_precision == "fp16"))
 
     num_update_steps_per_epoch = len(train_loader)
     args.max_train_steps = args.num_epochs * num_update_steps_per_epoch
@@ -496,37 +533,49 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            # Latent DDPM — encode with frozen VAE
+            # Keep VAE encode out of autocast to avoid fp16 instability in norm layers.
             if vae:
                 with torch.no_grad():
                     images = vae.encode(images)
                 images = images * 0.1845   # scale to ~unit std
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype)
+                if use_mixed else nullcontext()
+            )
+            with amp_ctx:
+                # CFG class embeddings (with 10 % unconditional dropout inside ClassEmbedder)
+                class_emb = class_embedder(labels) if class_embedder is not None else None
 
-            # CFG class embeddings (with 10 % unconditional dropout inside ClassEmbedder)
-            class_emb = class_embedder(labels) if class_embedder is not None else None
+                # Forward diffusion
+                noise = torch.randn_like(images)
+                timesteps = torch.randint(0, args.num_train_timesteps, (batch_size,), device=device).long()
+                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
 
-            # Forward diffusion
-            noise = torch.randn_like(images)
-            timesteps = torch.randint(0, args.num_train_timesteps, (batch_size,), device=device).long()
-            noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+                # UNet noise prediction
+                model_pred = unet(noisy_images, timesteps, c=class_emb)
 
-            # UNet noise prediction
-            model_pred = unet(noisy_images, timesteps, c=class_emb)
+                if args.prediction_type == 'epsilon':
+                    target = noise
+                else:
+                    raise NotImplementedError(f"prediction_type {args.prediction_type} not supported.")
 
-            if args.prediction_type == 'epsilon':
-                target = noise
-            else:
-                raise NotImplementedError(f"prediction_type {args.prediction_type} not supported.")
-
-            loss = F.mse_loss(model_pred, target)
+                loss = F.mse_loss(model_pred, target)
             loss_m.update(loss.item())
 
-            loss.backward()
-            if args.grad_clip:
-                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                if args.grad_clip:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                optimizer.step()
             lr_scheduler.step()
             ema.update(unet_wo_ddp)
             progress_bar.update(1)
@@ -540,38 +589,40 @@ def main():
                 wandb_logger.log({'loss': loss_m.avg, 'lr': optimizer.param_groups[0]['lr']})
 
         # ===================== Epoch-end: Sample & Save =====================
-        ema.apply_shadow(unet_wo_ddp)
-        unet.eval()
+        do_sample = ((epoch + 1) % max(1, args.sample_every_epochs) == 0)
+        if do_sample:
+            ema.apply_shadow(unet_wo_ddp)
+            unet.eval()
 
-        generator = torch.Generator(device=device)
-        generator.manual_seed(epoch + args.seed)
+            generator = torch.Generator(device=device)
+            generator.manual_seed(epoch + args.seed)
 
-        if args.use_cfg:
-            classes = torch.randint(0, args.num_classes, (4,), device=device)
-            gen_images = pipeline(
-                batch_size=4,
-                num_inference_steps=args.num_inference_steps,
-                classes=classes.tolist(),
-                guidance_scale=args.cfg_guidance_scale,
-                generator=generator,
-                device=device,
-            )
-        else:
-            gen_images = pipeline(
-                batch_size=4,
-                num_inference_steps=args.num_inference_steps,
-                generator=generator,
-                device=device,
-            )
+            if args.use_cfg:
+                classes = torch.randint(0, args.num_classes, (4,), device=device)
+                gen_images = pipeline(
+                    batch_size=4,
+                    num_inference_steps=args.num_inference_steps,
+                    classes=classes.tolist(),
+                    guidance_scale=args.cfg_guidance_scale,
+                    generator=generator,
+                    device=device,
+                )
+            else:
+                gen_images = pipeline(
+                    batch_size=4,
+                    num_inference_steps=args.num_inference_steps,
+                    generator=generator,
+                    device=device,
+                )
 
-        grid_image = Image.new('RGB', (4 * args.image_size, args.image_size))
-        for i, image in enumerate(gen_images):
-            grid_image.paste(image, (i * args.image_size, 0))
+            grid_image = Image.new('RGB', (4 * args.image_size, args.image_size))
+            for i, image in enumerate(gen_images):
+                grid_image.paste(image, (i * args.image_size, 0))
 
-        if is_primary(args):
-            wandb_logger.log({'gen_images': wandb.Image(grid_image)})
+            if is_primary(args):
+                wandb_logger.log({'gen_images': wandb.Image(grid_image)})
 
-        ema.restore(unet_wo_ddp)
+            ema.restore(unet_wo_ddp)
 
         if is_primary(args):
             save_checkpoint(

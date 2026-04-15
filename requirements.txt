@@ -5,3 +5,4 @@ wandb
 scipy
 tqdm
 pandas
+torchinfo
