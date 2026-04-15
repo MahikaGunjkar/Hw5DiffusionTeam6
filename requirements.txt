@@ -1,4 +1,5 @@
 torchmetrics[image]
+pytorch-lightning
 ruamel.yaml
 wandb
 scipy

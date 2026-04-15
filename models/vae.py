@@ -45,7 +45,15 @@ class VAE(nn.Module):
         return dec
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        # PyTorch>=2.6 changed torch.load default to weights_only=True.
+        # Lightning checkpoints usually require full unpickling.
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            # Backward compatibility with older PyTorch versions.
+            ckpt = torch.load(path, map_location="cpu")
+
+        sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:

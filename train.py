@@ -23,6 +23,22 @@ from utils import seed_everything, init_distributed_device, is_primary, AverageM
 
 logger = get_logger(__name__)
 
+DEFAULT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+COLAB_ROOT_DIR = "/content/Hw5DiffusionTeam6"
+ROOT_DIR = os.environ.get("PROJECT_ROOT")
+if ROOT_DIR is None:
+    if "google.colab" in sys.modules and os.path.isdir(COLAB_ROOT_DIR):
+        ROOT_DIR = COLAB_ROOT_DIR
+    else:
+        ROOT_DIR = DEFAULT_ROOT_DIR
+
+
+def resolve_path(path: str) -> str:
+    """Resolve relative paths against a fixed project root."""
+    if path is None:
+        return None
+    return path if os.path.isabs(path) else os.path.join(ROOT_DIR, path)
+
 
 # ===================== Tar Extraction Helper =====================
 
@@ -194,6 +210,7 @@ def parse_args():
 
     # Load YAML config and set as new defaults
     if args.config is not None:
+        args.config = resolve_path(args.config)
         with open(args.config, 'r', encoding='utf-8') as f:
             file_yaml = yaml.YAML()
             config_args = file_yaml.load(f)
@@ -214,6 +231,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.extract_dir = resolve_path(args.extract_dir)
+    args.output_dir = resolve_path(args.output_dir)
+    if args.data_dir is not None:
+        args.data_dir = resolve_path(args.data_dir)
+
     seed_everything(args.seed)
 
     logging.basicConfig(
@@ -333,7 +355,7 @@ def main():
     vae = None
     if args.latent_ddpm:
         vae = VAE()
-        vae.init_from_ckpt('pretrained/model.ckpt')
+        vae.init_from_ckpt(resolve_path('pretrained/model.ckpt'))
         vae.eval()
 
     class_embedder = None
@@ -415,7 +437,14 @@ def main():
             file_yaml.dump(experiment_config, f)
 
     if is_primary(args):
-        wandb_logger = wandb.init(project='ddpm', name=args.baseline, config=vars(args))
+        run_name = getattr(args, "run_name", None)
+        wandb_entity = os.getenv("WANDB_ENTITY", "idl-project-mm")
+        wandb_logger = wandb.init(
+            project='ddpm',
+            entity=wandb_entity,
+            name=run_name,
+            config=vars(args),
+        )
 
     # ===================== Training Loop =====================
     if is_primary(args):
