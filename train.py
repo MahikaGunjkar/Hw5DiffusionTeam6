@@ -415,7 +415,7 @@ def main():
             file_yaml.dump(experiment_config, f)
 
     if is_primary(args):
-        wandb_logger = wandb.init(project='ddpm', name=args.run_name, config=vars(args))
+        wandb_logger = wandb.init(project='ddpm', name=args.baseline, config=vars(args))
 
     # ===================== Training Loop =====================
     if is_primary(args):

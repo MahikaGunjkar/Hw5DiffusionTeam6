@@ -17,3 +17,4 @@ wandb/
 *.zip
 generated_images/
 submission.csv
+train_on_colab.ipynb
