@@ -4,7 +4,7 @@ data_dir: ./data
 image_size: 128
 batch_size: 32
 num_workers: 4
-subset: 1.0
+subset: 0.3
 num_classes: 100
 num_epochs: 50
 learning_rate: 1e-4
@@ -28,5 +28,5 @@ unet_ch_mult: [1, 2, 2, 4]
 unet_attn: [2, 3]
 unet_dropout: 0.0
 latent_ddpm: true
-use_cfg: false
+use_cfg: true
 use_ddim: true
