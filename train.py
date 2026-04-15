@@ -157,6 +157,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--num_classes", type=int, default=100)
+    parser.add_argument("--subset", type=float, default=1.0,
+                        help="Fraction of training data to use (0 < subset <= 1).")
 
     # ---- Training ----
     parser.add_argument("--run_name", type=str, default=None)
@@ -292,6 +294,23 @@ def main():
     ])
 
     train_dataset = datasets.ImageFolder(root=data_dir, transform=transform)
+    full_train_size = len(train_dataset)
+
+    if not (0 < args.subset <= 1.0):
+        raise ValueError(f"--subset must be in (0, 1], got {args.subset}")
+
+    if args.subset < 1.0:
+        subset_size = max(1, int(full_train_size * args.subset))
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+        subset_indices = torch.randperm(full_train_size, generator=generator)[:subset_size].tolist()
+        train_dataset = torch.utils.data.Subset(train_dataset, subset_indices)
+        logger.info(
+            f"Using subset: {subset_size}/{full_train_size} samples "
+            f"({subset_size / full_train_size:.2%})"
+        )
+    else:
+        logger.info(f"Using full dataset: {full_train_size} samples")
 
     sampler = None
     if args.distributed:
