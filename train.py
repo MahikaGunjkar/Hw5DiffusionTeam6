@@ -116,19 +116,101 @@ def bind_wandb_resume_config(args, environ=None):
     return args
 
 
-def _wandb_latest_epoch_from_run_files(run) -> Optional[int]:
-    """Largest N such that checkpoints/checkpoint_epoch_N.pth exists on the run."""
-    pat = re.compile(r"(?:^|/)checkpoints/checkpoint_epoch_(\d+)\.pth$")
-    best: Optional[int] = None
-    for wf in run.files():
-        name = getattr(wf, "name", "") or ""
-        m = pat.match(name)
-        if not m:
-            continue
-        n = int(m.group(1))
-        if best is None or n > best:
-            best = n
-    return best
+def checkpoint_artifact_name(run_id: str) -> str:
+    return f"run-{str(run_id).strip()}-training-checkpoints"
+
+
+def checkpoint_artifact_alias_for_resume(epoch: Optional[int]) -> str:
+    return "latest" if epoch is None else f"epoch-{int(epoch)}"
+
+
+def upload_wandb_checkpoints(
+    run,
+    wandb_module,
+    run_id,
+    ckpt_path,
+    ema_ckpt_path,
+    epoch,
+    global_step,
+    is_last_epoch,
+):
+    aliases = [f"epoch-{int(epoch)}"]
+    if is_last_epoch:
+        aliases.append("last")
+
+    artifact = wandb_module.Artifact(
+        name=checkpoint_artifact_name(run_id),
+        type="model",
+        description="Versioned training checkpoints for a single run.",
+        metadata={
+            "run_id": str(run_id).strip(),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "is_last": bool(is_last_epoch),
+        },
+    )
+    artifact.add_file(local_path=ckpt_path, name="checkpoint.pth")
+    artifact.add_file(local_path=ema_ckpt_path, name="ema_checkpoint.pth")
+    logged_artifact = run.log_artifact(artifact, aliases=aliases)
+    if hasattr(logged_artifact, "wait"):
+        logged_artifact.wait()
+
+    if is_last_epoch:
+        last_ckpt = os.path.join(os.path.dirname(ckpt_path), 'checkpoint_last.pth')
+        last_ema = os.path.join(os.path.dirname(ema_ckpt_path), 'ema_checkpoint_last.pth')
+        shutil.copy2(ckpt_path, last_ckpt)
+        shutil.copy2(ema_ckpt_path, last_ema)
+
+
+def _materialize_artifact_checkpoint(artifact, ckpt_dir: str) -> str:
+    artifact_dir = artifact.download(root=ckpt_dir)
+    artifact_dir = os.path.abspath(str(artifact_dir))
+    epoch = artifact.metadata.get("epoch") if getattr(artifact, "metadata", None) else None
+    if epoch is None:
+        raise ValueError(
+            f"Checkpoint artifact {artifact.name!r} is missing required metadata['epoch']."
+        )
+
+    checkpoint_src = os.path.join(artifact_dir, "checkpoint.pth")
+    ema_src = os.path.join(artifact_dir, "ema_checkpoint.pth")
+    if not os.path.isfile(checkpoint_src):
+        raise FileNotFoundError(
+            f"Checkpoint artifact {artifact.name!r} did not contain checkpoint.pth."
+        )
+
+    epoch = int(epoch)
+    checkpoint_dst = os.path.join(ckpt_dir, f"checkpoint_epoch_{epoch}.pth")
+    shutil.copy2(checkpoint_src, checkpoint_dst)
+
+    if os.path.isfile(ema_src):
+        ema_dst = os.path.join(ckpt_dir, f"ema_checkpoint_epoch_{epoch}.pth")
+        shutil.copy2(ema_src, ema_dst)
+
+    if artifact.metadata.get("is_last"):
+        shutil.copy2(checkpoint_dst, os.path.join(ckpt_dir, "checkpoint_last.pth"))
+        if os.path.isfile(ema_src):
+            shutil.copy2(
+                os.path.join(ckpt_dir, f"ema_checkpoint_epoch_{epoch}.pth"),
+                os.path.join(ckpt_dir, "ema_checkpoint_last.pth"),
+            )
+
+    return checkpoint_dst
+
+
+def _download_wandb_training_checkpoint_from_artifact(
+    run_entity: str,
+    run_project: str,
+    run_id: str,
+    epoch: Optional[int],
+    ckpt_dir: str,
+):
+    alias = checkpoint_artifact_alias_for_resume(epoch)
+    artifact_ref = f"{run_entity}/{run_project}/{checkpoint_artifact_name(run_id)}:{alias}"
+    logger.info("Downloading W&B checkpoint artifact %s", artifact_ref)
+
+    api = wandb.Api()
+    artifact = api.artifact(artifact_ref)
+    return _materialize_artifact_checkpoint(artifact, ckpt_dir)
 
 
 def download_wandb_training_checkpoint(
@@ -139,76 +221,27 @@ def download_wandb_training_checkpoint(
     """
     Download a training checkpoint from a W&B run.
 
-    run_path format: entity/project/run_id (same as wandb.restore run_path).
+    Download a checkpoint artifact from the per-run checkpoint collection.
 
-    If ``epoch`` is None: prefer ``checkpoints/checkpoint_last.pth`` (saved when training
-    finishes); if missing, use the largest ``checkpoint_epoch_N.pth`` on the run.
+    run_path format: entity/project/run_id.
 
-    If ``epoch`` is set: download that epoch's ``checkpoint_epoch_{epoch}.pth``.
+    If ``epoch`` is None: download the artifact version with alias ``latest``.
+    If ``epoch`` is set: download the artifact version with alias ``epoch-{epoch}``.
 
     Returns absolute path to the main checkpoint file.
     """
     run_entity, run_project, slug = parse_wandb_run_path(run_path)
-    run_path = f"{run_entity}/{run_project}/{slug}"
     download_exp_dir = resolve_path(os.path.join(cache_root, slug))
     ckpt_dir = os.path.join(download_exp_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    api = wandb.Api()
-    run = api.run(run_path)
-
-    resolved_epoch = epoch
-    use_last_names = False
-    if resolved_epoch is None:
-        main_rel = "checkpoints/checkpoint_last.pth"
-        logger.info("Downloading W&B last checkpoint %s from run %s", main_rel, run_path)
-        try:
-            f_main = run.file(main_rel)
-            local_main = f_main.download(root=download_exp_dir, replace=True)
-            use_last_names = True
-        except Exception as e:
-            logger.warning(
-                "checkpoint_last.pth not on run %s (%s); falling back to latest checkpoint_epoch_*",
-                run_path,
-                e,
-            )
-            resolved_epoch = _wandb_latest_epoch_from_run_files(run)
-            if resolved_epoch is None:
-                raise FileNotFoundError(
-                    f"W&B run {run_path} has no checkpoint_last.pth and no checkpoint_epoch_*.pth files."
-                ) from e
-            main_rel = f"checkpoints/checkpoint_epoch_{resolved_epoch}.pth"
-            logger.info("Downloading W&B file %s from run %s", main_rel, run_path)
-            f_main = run.file(main_rel)
-            local_main = f_main.download(root=download_exp_dir, replace=True)
-    else:
-        if resolved_epoch < 0:
-            raise ValueError(f"wandb_ckpt_epoch must be >= 0, got {resolved_epoch}")
-        main_rel = f"checkpoints/checkpoint_epoch_{resolved_epoch}.pth"
-        logger.info("Downloading W&B file %s from run %s", main_rel, run_path)
-        f_main = run.file(main_rel)
-        local_main = f_main.download(root=download_exp_dir, replace=True)
-    if local_main is None:
-        local_main = os.path.join(ckpt_dir, os.path.basename(main_rel))
-    local_main = os.path.abspath(str(local_main))
-    if not os.path.isfile(local_main):
-        raise FileNotFoundError(
-            f"W&B run {run_path} has no usable file for {main_rel} (got {local_main!r})."
-        )
-
-    if use_last_names:
-        ema_rel = "checkpoints/ema_checkpoint_last.pth"
-    else:
-        assert resolved_epoch is not None
-        ema_rel = f"checkpoints/ema_checkpoint_epoch_{resolved_epoch}.pth"
-    try:
-        f_ema = run.file(ema_rel)
-        f_ema.download(root=download_exp_dir, replace=True)
-        logger.info("Downloaded %s", ema_rel)
-    except Exception as e:
-        logger.warning("Optional EMA file %s not downloaded: %s", ema_rel, e)
-
-    return local_main
+    return _download_wandb_training_checkpoint_from_artifact(
+        run_entity,
+        run_project,
+        slug,
+        epoch,
+        ckpt_dir,
+    )
 
 
 # ===================== Tar Extraction Helper =====================
@@ -387,9 +420,6 @@ def parse_args():
 
     # ---- Checkpoint (inference) ----
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--wandb_log_checkpoints", type=str2bool, default=True,
-                        help="Upload checkpoint_epoch_*.pth and EMA to W&B each epoch; "
-                             "also upload checkpoint_last.pth after final epoch.")
     parser.add_argument("--wandb_run_id", type=str, default=None,
                         help="Existing W&B run id to resume logging. When wandb_ckpt_run_path is set, "
                              "this must match its run_id (or can be omitted).")
@@ -405,8 +435,8 @@ def parse_args():
                         help="entity/project/run_id — authoritative W&B run to resume from. "
                              "When set, train.py downloads checkpoints from this run and resumes logging to it.")
     parser.add_argument("--wandb_ckpt_epoch", type=int, default=None,
-                        help="Epoch N for checkpoints/checkpoint_epoch_N.pth; omit for checkpoint_last.pth "
-                             "(or largest epoch on run if last is absent).")
+                        help="Epoch N for the checkpoint artifact alias epoch-N; omit to use the latest "
+                             "checkpoint artifact version for the target run.")
     parser.add_argument("--wandb_ckpt_cache_dir", type=str, default="./wandb_resume_cache",
                         help="Local directory root for downloaded W&B checkpoints.")
 
@@ -974,23 +1004,17 @@ def main():
             torch.save({'ema_shadow': ema.shadow}, ema_ckpt_path)
             logger.info(f"EMA checkpoint saved: {ema_ckpt_path}")
 
-            if args.wandb_log_checkpoints:
-                ckpt_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
-                try:
-                    wandb.save(ckpt_path, base_path=output_dir, policy='now')
-                    wandb.save(ema_ckpt_path, base_path=output_dir, policy='now')
-                except Exception as e:
-                    logger.warning("wandb.save epoch checkpoint failed: %s", e)
-                if epoch == args.num_epochs - 1:
-                    last_ckpt = os.path.join(save_dir, 'checkpoint_last.pth')
-                    last_ema = os.path.join(save_dir, 'ema_checkpoint_last.pth')
-                    shutil.copy2(ckpt_path, last_ckpt)
-                    shutil.copy2(ema_ckpt_path, last_ema)
-                    try:
-                        wandb.save(last_ckpt, base_path=output_dir, policy='now')
-                        wandb.save(last_ema, base_path=output_dir, policy='now')
-                    except Exception as e:
-                        logger.warning("wandb.save last checkpoint failed: %s", e)
+            ckpt_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
+            upload_wandb_checkpoints(
+                wandb_logger,
+                wandb_module=wandb,
+                run_id=args.wandb_run_id or wandb_logger.id,
+                ckpt_path=ckpt_path,
+                ema_ckpt_path=ema_ckpt_path,
+                epoch=epoch,
+                global_step=lr_scheduler.last_epoch,
+                is_last_epoch=(epoch == args.num_epochs - 1),
+            )
 
 
 if __name__ == '__main__':

@@ -36,7 +36,6 @@ latent_ddpm: true
 use_cfg: true
 use_ddim: true
 sample_every_epochs: 5
-wandb_log_checkpoints: true
 # Resume: when resume_enabled=true, checkpoint download and W&B log resume should target the same run.
 # Prefer setting wandb_ckpt_run_path; train.py will derive wandb_run_id from it and default wandb_resume to must.
 resume_enabled: false

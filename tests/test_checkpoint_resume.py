@@ -4,11 +4,18 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from schedulers import DDPMScheduler, DDIMScheduler
-from train import bind_wandb_resume_config
+from train import (
+    checkpoint_artifact_alias_for_resume,
+    checkpoint_artifact_name,
+    bind_wandb_resume_config,
+    download_wandb_training_checkpoint,
+    upload_wandb_checkpoints,
+)
 from utils.checkpoint import (
     infer_resume_global_step,
     load_checkpoint,
@@ -129,6 +136,78 @@ class CheckpointResumeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires a specific W&B run target"):
             bind_wandb_resume_config(args, environ={})
+
+    def test_upload_wandb_checkpoints_raises_when_upload_fails(self):
+        fake_run = mock.Mock()
+        fake_wandb = mock.Mock()
+        fake_artifact = mock.Mock()
+        fake_wandb.Artifact.return_value = fake_artifact
+        fake_run.log_artifact.side_effect = RuntimeError("upload failed")
+
+        with self.assertRaisesRegex(RuntimeError, "upload failed"):
+            upload_wandb_checkpoints(
+                fake_run,
+                wandb_module=fake_wandb,
+                run_id="run123",
+                ckpt_path="/tmp/output/checkpoints/checkpoint_epoch_0.pth",
+                ema_ckpt_path="/tmp/output/checkpoints/ema_checkpoint_epoch_0.pth",
+                epoch=0,
+                global_step=10,
+                is_last_epoch=False,
+            )
+
+    def test_checkpoint_artifact_name_is_derived_from_run_id(self):
+        self.assertEqual(
+            checkpoint_artifact_name("run123"),
+            "run-run123-training-checkpoints",
+        )
+
+    def test_checkpoint_artifact_alias_for_resume_uses_latest_by_default(self):
+        self.assertEqual(checkpoint_artifact_alias_for_resume(None), "latest")
+        self.assertEqual(checkpoint_artifact_alias_for_resume(7), "epoch-7")
+
+    def test_upload_wandb_checkpoints_logs_model_artifact(self):
+        fake_run = mock.Mock()
+        fake_wandb = mock.Mock()
+        fake_artifact = mock.Mock()
+        fake_wandb.Artifact.return_value = fake_artifact
+
+        with mock.patch("train.shutil.copy2"):
+            upload_wandb_checkpoints(
+                fake_run,
+                wandb_module=fake_wandb,
+                run_id="run123",
+                ckpt_path="/tmp/output/checkpoints/checkpoint_epoch_3.pth",
+                ema_ckpt_path="/tmp/output/checkpoints/ema_checkpoint_epoch_3.pth",
+                epoch=3,
+                global_step=40,
+                is_last_epoch=True,
+            )
+
+        fake_wandb.Artifact.assert_called_once()
+        fake_artifact.add_file.assert_any_call(
+            local_path="/tmp/output/checkpoints/checkpoint_epoch_3.pth",
+            name="checkpoint.pth",
+        )
+        fake_artifact.add_file.assert_any_call(
+            local_path="/tmp/output/checkpoints/ema_checkpoint_epoch_3.pth",
+            name="ema_checkpoint.pth",
+        )
+        fake_run.log_artifact.assert_called_once()
+        _, kwargs = fake_run.log_artifact.call_args
+        self.assertEqual(kwargs["aliases"], ["epoch-3", "last"])
+
+    def test_download_wandb_training_checkpoint_does_not_fallback_to_legacy_run_files(self):
+        with mock.patch(
+            "train._download_wandb_training_checkpoint_from_artifact",
+            side_effect=FileNotFoundError("artifact missing"),
+        ):
+            with self.assertRaisesRegex(FileNotFoundError, "artifact missing"):
+                download_wandb_training_checkpoint(
+                    "team-a/ddpm/run123",
+                    epoch=None,
+                    cache_root=self.tmpdir,
+                )
 
 
 if __name__ == "__main__":
