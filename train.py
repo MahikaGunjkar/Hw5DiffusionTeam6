@@ -1,6 +1,9 @@
 import os
 import sys
 import copy
+from typing import Optional
+import shutil
+import re
 import tarfile
 import argparse
 from contextlib import nullcontext
@@ -20,7 +23,17 @@ from torchvision.utils import make_grid
 from models import UNet, VAE, ClassEmbedder
 from schedulers import DDPMScheduler, DDIMScheduler
 from pipelines import DDPMPipeline
-from utils import seed_everything, init_distributed_device, is_primary, AverageMeter, str2bool, save_checkpoint
+from utils import (
+    seed_everything,
+    init_distributed_device,
+    is_primary,
+    AverageMeter,
+    infer_resume_global_step,
+    str2bool,
+    save_checkpoint,
+    load_checkpoint,
+    restore_lr_scheduler_progress,
+)
 
 logger = get_logger(__name__)
 
@@ -39,6 +52,163 @@ def resolve_path(path: str) -> str:
     if path is None:
         return None
     return path if os.path.isabs(path) else os.path.join(ROOT_DIR, path)
+
+
+def parse_wandb_run_path(run_path: Optional[str]) -> Optional[tuple[str, str, str]]:
+    if run_path is None:
+        return None
+
+    run_path = str(run_path).strip()
+    parts = [part.strip() for part in run_path.split("/")]
+    if len(parts) != 3 or any(not part for part in parts):
+        raise ValueError(
+            f"wandb_ckpt_run_path must be entity/project/run_id, got {run_path!r}"
+        )
+    return parts[0], parts[1], parts[2]
+
+
+def bind_wandb_resume_config(args, environ=None):
+    environ = os.environ if environ is None else environ
+
+    args.wandb_entity = environ.get("WANDB_ENTITY", "idl-project-mm")
+    args.wandb_project = "ddpm"
+
+    if not args.resume_enabled:
+        return args
+
+    run_path_parts = parse_wandb_run_path(args.wandb_ckpt_run_path)
+    env_run_id = (environ.get("WANDB_RUN_ID") or "").strip() or None
+    env_resume = (environ.get("WANDB_RESUME") or "").strip() or None
+    env_entity = (environ.get("WANDB_ENTITY") or "").strip() or None
+
+    if run_path_parts is not None:
+        run_entity, run_project, run_id = run_path_parts
+        if args.wandb_run_id is not None and str(args.wandb_run_id).strip() != run_id:
+            raise ValueError(
+                "wandb_run_id must match the run_id embedded in wandb_ckpt_run_path "
+                f"({args.wandb_run_id!r} != {run_id!r})"
+            )
+        if env_run_id is not None and env_run_id != run_id:
+            raise ValueError(
+                "WANDB_RUN_ID must match the run_id embedded in wandb_ckpt_run_path "
+                f"({env_run_id!r} != {run_id!r})"
+            )
+        if env_entity is not None and env_entity != run_entity:
+            raise ValueError(
+                "WANDB_ENTITY must match the entity embedded in wandb_ckpt_run_path "
+                f"({env_entity!r} != {run_entity!r})"
+            )
+        args.wandb_entity = run_entity
+        args.wandb_project = run_project
+        args.wandb_run_id = run_id
+    else:
+        resolved_run_id = args.wandb_run_id or env_run_id
+        if resolved_run_id is None:
+            raise ValueError(
+                "resume_enabled=true requires a specific W&B run target: "
+                "set wandb_ckpt_run_path (preferred) or wandb_run_id / WANDB_RUN_ID."
+            )
+        args.wandb_run_id = str(resolved_run_id).strip()
+
+    if args.wandb_resume is None:
+        args.wandb_resume = env_resume or "must"
+
+    return args
+
+
+def _wandb_latest_epoch_from_run_files(run) -> Optional[int]:
+    """Largest N such that checkpoints/checkpoint_epoch_N.pth exists on the run."""
+    pat = re.compile(r"(?:^|/)checkpoints/checkpoint_epoch_(\d+)\.pth$")
+    best: Optional[int] = None
+    for wf in run.files():
+        name = getattr(wf, "name", "") or ""
+        m = pat.match(name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if best is None or n > best:
+            best = n
+    return best
+
+
+def download_wandb_training_checkpoint(
+    run_path: str,
+    epoch: Optional[int],
+    cache_root: str,
+) -> str:
+    """
+    Download a training checkpoint from a W&B run.
+
+    run_path format: entity/project/run_id (same as wandb.restore run_path).
+
+    If ``epoch`` is None: prefer ``checkpoints/checkpoint_last.pth`` (saved when training
+    finishes); if missing, use the largest ``checkpoint_epoch_N.pth`` on the run.
+
+    If ``epoch`` is set: download that epoch's ``checkpoint_epoch_{epoch}.pth``.
+
+    Returns absolute path to the main checkpoint file.
+    """
+    run_entity, run_project, slug = parse_wandb_run_path(run_path)
+    run_path = f"{run_entity}/{run_project}/{slug}"
+    download_exp_dir = resolve_path(os.path.join(cache_root, slug))
+    ckpt_dir = os.path.join(download_exp_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    api = wandb.Api()
+    run = api.run(run_path)
+
+    resolved_epoch = epoch
+    use_last_names = False
+    if resolved_epoch is None:
+        main_rel = "checkpoints/checkpoint_last.pth"
+        logger.info("Downloading W&B last checkpoint %s from run %s", main_rel, run_path)
+        try:
+            f_main = run.file(main_rel)
+            local_main = f_main.download(root=download_exp_dir, replace=True)
+            use_last_names = True
+        except Exception as e:
+            logger.warning(
+                "checkpoint_last.pth not on run %s (%s); falling back to latest checkpoint_epoch_*",
+                run_path,
+                e,
+            )
+            resolved_epoch = _wandb_latest_epoch_from_run_files(run)
+            if resolved_epoch is None:
+                raise FileNotFoundError(
+                    f"W&B run {run_path} has no checkpoint_last.pth and no checkpoint_epoch_*.pth files."
+                ) from e
+            main_rel = f"checkpoints/checkpoint_epoch_{resolved_epoch}.pth"
+            logger.info("Downloading W&B file %s from run %s", main_rel, run_path)
+            f_main = run.file(main_rel)
+            local_main = f_main.download(root=download_exp_dir, replace=True)
+    else:
+        if resolved_epoch < 0:
+            raise ValueError(f"wandb_ckpt_epoch must be >= 0, got {resolved_epoch}")
+        main_rel = f"checkpoints/checkpoint_epoch_{resolved_epoch}.pth"
+        logger.info("Downloading W&B file %s from run %s", main_rel, run_path)
+        f_main = run.file(main_rel)
+        local_main = f_main.download(root=download_exp_dir, replace=True)
+    if local_main is None:
+        local_main = os.path.join(ckpt_dir, os.path.basename(main_rel))
+    local_main = os.path.abspath(str(local_main))
+    if not os.path.isfile(local_main):
+        raise FileNotFoundError(
+            f"W&B run {run_path} has no usable file for {main_rel} (got {local_main!r})."
+        )
+
+    if use_last_names:
+        ema_rel = "checkpoints/ema_checkpoint_last.pth"
+    else:
+        assert resolved_epoch is not None
+        ema_rel = f"checkpoints/ema_checkpoint_epoch_{resolved_epoch}.pth"
+    try:
+        f_ema = run.file(ema_rel)
+        f_ema.download(root=download_exp_dir, replace=True)
+        logger.info("Downloaded %s", ema_rel)
+    except Exception as e:
+        logger.warning("Optional EMA file %s not downloaded: %s", ema_rel, e)
+
+    return local_main
 
 
 # ===================== Tar Extraction Helper =====================
@@ -217,6 +387,28 @@ def parse_args():
 
     # ---- Checkpoint (inference) ----
     parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--wandb_log_checkpoints", type=str2bool, default=True,
+                        help="Upload checkpoint_epoch_*.pth and EMA to W&B each epoch; "
+                             "also upload checkpoint_last.pth after final epoch.")
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Existing W&B run id to resume logging. When wandb_ckpt_run_path is set, "
+                             "this must match its run_id (or can be omitted).")
+    parser.add_argument("--wandb_resume", type=str, default=None,
+                        choices=["must", "allow", "never", "auto"],
+                        help="W&B resume policy; when resume_enabled=true and this is omitted, "
+                             "train.py defaults to 'must' so logs must continue on the same run.")
+    parser.add_argument("--resume_enabled", type=str2bool, default=False,
+                        help="If true: resume both training state and W&B logging. Prefer setting "
+                             "wandb_ckpt_run_path so checkpoint download and log resume are bound to the same run. "
+                             "If false: ignore wandb_run_id/wandb_resume/wandb_ckpt_* (fresh W&B run).")
+    parser.add_argument("--wandb_ckpt_run_path", type=str, default=None,
+                        help="entity/project/run_id — authoritative W&B run to resume from. "
+                             "When set, train.py downloads checkpoints from this run and resumes logging to it.")
+    parser.add_argument("--wandb_ckpt_epoch", type=int, default=None,
+                        help="Epoch N for checkpoints/checkpoint_epoch_N.pth; omit for checkpoint_last.pth "
+                             "(or largest epoch on run if last is absent).")
+    parser.add_argument("--wandb_ckpt_cache_dir", type=str, default="./wandb_resume_cache",
+                        help="Local directory root for downloaded W&B checkpoints.")
 
     # First parse — get config file path
     args = parser.parse_args()
@@ -240,6 +432,24 @@ def parse_args():
     if args.sample_every_epochs <= 0:
         raise ValueError(f"--sample_every_epochs must be >= 1, got {args.sample_every_epochs}")
 
+    if args.resume_enabled:
+        bind_wandb_resume_config(args)
+        if args.ckpt is None:
+            if not args.wandb_ckpt_run_path:
+                raise ValueError(
+                    "resume_enabled=true requires either --ckpt (local) or "
+                    "wandb_ckpt_run_path (download from W&B; leave wandb_ckpt_epoch unset for last checkpoint)."
+                )
+            if args.wandb_ckpt_epoch is not None and args.wandb_ckpt_epoch < 0:
+                raise ValueError(f"wandb_ckpt_epoch must be >= 0, got {args.wandb_ckpt_epoch}")
+    else:
+        args.wandb_run_id = None
+        args.wandb_resume = None
+        args.wandb_ckpt_run_path = None
+        args.wandb_ckpt_epoch = None
+        args.wandb_entity = os.getenv("WANDB_ENTITY", "idl-project-mm")
+        args.wandb_project = "ddpm"
+
     return args
 
 
@@ -259,6 +469,20 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
+    if args.resume_enabled and args.ckpt is None:
+        if not os.getenv("WANDB_API_KEY"):
+            raise RuntimeError(
+                "resume_enabled with W&B checkpoint download requires WANDB_API_KEY "
+                "(or use a local --ckpt path)."
+            )
+        cache_root = resolve_path(args.wandb_ckpt_cache_dir)
+        args.ckpt = download_wandb_training_checkpoint(
+            args.wandb_ckpt_run_path,
+            args.wandb_ckpt_epoch,
+            cache_root,
+        )
+        logger.info("Using checkpoint downloaded from W&B: %s", args.ckpt)
 
     device = init_distributed_device(args)
     if args.distributed:
@@ -348,14 +572,35 @@ def main():
     args.total_batch_size = total_batch_size
 
     # ---- Experiment folder ----
-    if args.run_name is None:
+    resume_ckpt_path = None
+    if args.ckpt is not None:
+        ckpt_resolved = args.ckpt if os.path.isabs(args.ckpt) else resolve_path(args.ckpt)
+        if not os.path.isfile(ckpt_resolved):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_resolved}")
+        ckpt_parent = os.path.dirname(ckpt_resolved)
+        if os.path.basename(ckpt_parent) != "checkpoints":
+            raise ValueError(
+                "--ckpt must point to .../<experiment>/checkpoints/*.pth "
+                "(e.g. checkpoint_epoch_*.pth or checkpoint_last.pth) "
+                f"(got parent {ckpt_parent!r})"
+            )
+        output_dir = os.path.dirname(ckpt_parent)
+        save_dir = ckpt_parent
+        args.run_name = os.path.basename(output_dir)
+        resume_ckpt_path = ckpt_resolved
+        logger.info(f"Resume: using experiment dir {output_dir}")
+    elif args.run_name is None:
         args.run_name = f'exp-{len(os.listdir(args.output_dir))}'
+        output_dir = os.path.join(args.output_dir, args.run_name)
+        save_dir = os.path.join(output_dir, 'checkpoints')
     else:
         args.run_name = f'exp-{len(os.listdir(args.output_dir))}-{args.run_name}'
-    output_dir = os.path.join(args.output_dir, args.run_name)
-    save_dir = os.path.join(output_dir, 'checkpoints')
-    if is_primary(args):
+        output_dir = os.path.join(args.output_dir, args.run_name)
+        save_dir = os.path.join(output_dir, 'checkpoints')
+    if args.ckpt is None and is_primary(args):
         os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(save_dir, exist_ok=True)
+    elif args.ckpt is not None and is_primary(args):
         os.makedirs(save_dir, exist_ok=True)
 
     # ===================== Model Setup =====================
@@ -380,9 +625,13 @@ def main():
             logger.warning("torch.compile is unavailable in this PyTorch version.")
         else:
             logger.info(f"Compiling UNet with mode='{args.compile_mode}'")
+            logger.warning(
+                "First training step may stall for minutes while torch.compile traces the graph; "
+                "progress bar stays at 0 until step 1 completes."
+            )
             if args.compile_mode in {"reduce-overhead", "max-autotune"}:
                 logger.warning(
-                    f"compile_mode='{args.compile_mode}' may have long first-step warmup."
+                    f"compile_mode='{args.compile_mode}' often has the longest warmup."
                 )
             unet = torch.compile(unet, mode=args.compile_mode)
     num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
@@ -434,7 +683,11 @@ def main():
         else torch.bfloat16 if args.mixed_precision == "bf16"
         else None
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_mixed and args.mixed_precision == "fp16"))
+    fp16_scaler_enabled = use_mixed and args.mixed_precision == "fp16"
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=fp16_scaler_enabled)
+    except (TypeError, AttributeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=fp16_scaler_enabled)
 
     num_update_steps_per_epoch = len(train_loader)
     args.max_train_steps = args.num_epochs * num_update_steps_per_epoch
@@ -485,6 +738,63 @@ def main():
         class_embedder=class_embedder_wo_ddp,
     )
 
+    start_epoch = 0
+    if resume_ckpt_path is not None:
+        logger.info("Loading training checkpoint: %s", resume_ckpt_path)
+        checkpoint = load_checkpoint(
+            unet_wo_ddp,
+            noise_scheduler,
+            vae_wo_ddp,
+            class_embedder_wo_ddp,
+            optimizer,
+            checkpoint_path=resume_ckpt_path,
+        )
+        done_epoch = checkpoint.get("epoch")
+        if done_epoch is None:
+            m = re.search(r"checkpoint_epoch_(\d+)\.pth$", resume_ckpt_path)
+            if m:
+                done_epoch = int(m.group(1))
+        if done_epoch is None and resume_ckpt_path.rstrip().endswith("checkpoint_last.pth"):
+            done_epoch = checkpoint.get("epoch")
+        if done_epoch is None:
+            raise ValueError(
+                "Checkpoint missing 'epoch' key and filename is not checkpoint_epoch_<n>.pth "
+                "(or checkpoint_last.pth with epoch stored in file)"
+            )
+        start_epoch = done_epoch + 1
+        resume_global_step = infer_resume_global_step(
+            checkpoint,
+            steps_per_epoch=num_update_steps_per_epoch,
+        )
+        if resume_global_step is None:
+            resume_global_step = start_epoch * num_update_steps_per_epoch
+        restore_lr_scheduler_progress(lr_scheduler, resume_global_step)
+        ema_path = os.path.join(save_dir, f"ema_checkpoint_epoch_{done_epoch}.pth")
+        if not os.path.isfile(ema_path):
+            ema_last = os.path.join(save_dir, "ema_checkpoint_last.pth")
+            if os.path.isfile(ema_last):
+                ema_path = ema_last
+        if os.path.isfile(ema_path):
+            try:
+                ema_data = torch.load(ema_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                ema_data = torch.load(ema_path, map_location="cpu")
+            raw = ema_data.get("ema_shadow", {})
+            ema.shadow = {
+                name: t.to(device).clone().detach()
+                for name, t in raw.items()
+                if name in dict(unet_wo_ddp.named_parameters())
+            }
+            logger.info("Loaded EMA shadow from %s", ema_path)
+        else:
+            logger.warning("No EMA file at %s; EMA shadow reset from loaded weights", ema_path)
+        logger.info(
+            "Resuming training from epoch %s (checkpoint ended after epoch index %s)",
+            start_epoch,
+            done_epoch,
+        )
+        logger.info("Restored LR scheduler progress to global step %s", resume_global_step)
+
     # ===================== Config Dump =====================
     if is_primary(args):
         experiment_config = vars(args)
@@ -494,13 +804,22 @@ def main():
 
     if is_primary(args):
         run_name = getattr(args, "run_name", None)
-        wandb_entity = os.getenv("WANDB_ENTITY", "idl-project-mm")
-        wandb_logger = wandb.init(
-            project='ddpm',
-            entity=wandb_entity,
+        wandb_kwargs = dict(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
             name=run_name,
             config=vars(args),
         )
+        run_id = None
+        resume_pol = None
+        if args.resume_enabled:
+            run_id = args.wandb_run_id
+            resume_pol = args.wandb_resume
+        if run_id:
+            wandb_kwargs["id"] = str(run_id).strip()
+        if resume_pol:
+            wandb_kwargs["resume"] = str(resume_pol).strip()
+        wandb_logger = wandb.init(**wandb_kwargs)
 
     # ===================== Training Loop =====================
     if is_primary(args):
@@ -511,10 +830,20 @@ def main():
         logger.info(f"  Total batch size       = {total_batch_size}")
         logger.info(f"  Steps per epoch        = {num_update_steps_per_epoch}")
         logger.info(f"  Total steps            = {args.max_train_steps}")
+        logger.info(f"  Start epoch            = {start_epoch}")
 
-    progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
+    if start_epoch >= args.num_epochs:
+        logger.warning("start_epoch >= num_epochs; nothing to train.")
+        return
 
-    for epoch in range(args.num_epochs):
+    global_step_initial = start_epoch * num_update_steps_per_epoch
+    progress_bar = tqdm(
+        range(args.max_train_steps),
+        initial=global_step_initial,
+        disable=not is_primary(args),
+    )
+
+    for epoch in range(start_epoch, args.num_epochs):
 
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
@@ -529,6 +858,11 @@ def main():
             class_embedder.train()
 
         for step, (images, labels) in enumerate(train_loader):
+            if step == 0 and is_primary(args):
+                logger.info(
+                    "Starting step 0: first batch from DataLoader + first forward/backward "
+                    "(slow if torch.compile just enabled)."
+                )
             batch_size = images.size(0)
             images = images.to(device)
             labels = labels.to(device)
@@ -626,13 +960,37 @@ def main():
 
         if is_primary(args):
             save_checkpoint(
-                unet_wo_ddp, inference_scheduler,
-                vae_wo_ddp, class_embedder_wo_ddp,
-                optimizer, epoch, save_dir=save_dir
+                unet_wo_ddp,
+                noise_scheduler,
+                vae_wo_ddp,
+                class_embedder_wo_ddp,
+                optimizer,
+                lr_scheduler,
+                epoch=epoch,
+                global_step=lr_scheduler.last_epoch,
+                save_dir=save_dir,
             )
             ema_ckpt_path = os.path.join(save_dir, f'ema_checkpoint_epoch_{epoch}.pth')
             torch.save({'ema_shadow': ema.shadow}, ema_ckpt_path)
             logger.info(f"EMA checkpoint saved: {ema_ckpt_path}")
+
+            if args.wandb_log_checkpoints:
+                ckpt_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
+                try:
+                    wandb.save(ckpt_path, base_path=output_dir, policy='now')
+                    wandb.save(ema_ckpt_path, base_path=output_dir, policy='now')
+                except Exception as e:
+                    logger.warning("wandb.save epoch checkpoint failed: %s", e)
+                if epoch == args.num_epochs - 1:
+                    last_ckpt = os.path.join(save_dir, 'checkpoint_last.pth')
+                    last_ema = os.path.join(save_dir, 'ema_checkpoint_last.pth')
+                    shutil.copy2(ckpt_path, last_ckpt)
+                    shutil.copy2(ema_ckpt_path, last_ema)
+                    try:
+                        wandb.save(last_ckpt, base_path=output_dir, policy='now')
+                        wandb.save(last_ema, base_path=output_dir, policy='now')
+                    except Exception as e:
+                        logger.warning("wandb.save last checkpoint failed: %s", e)
 
 
 if __name__ == '__main__':
