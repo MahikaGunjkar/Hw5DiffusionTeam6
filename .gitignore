@@ -12,6 +12,7 @@ __pycache__/
 *.pyc
 *.pth
 *.pt
+.env.local
 .DS_Store
 wandb/
 *.zip
