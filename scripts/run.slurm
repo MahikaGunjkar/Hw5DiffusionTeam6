@@ -32,7 +32,9 @@ echo "Slurm job id   : ${SLURM_JOB_ID}"
 echo "Slurm node(s)  : ${SLURM_JOB_NODELIST}"
 echo "=========================================================="
 
-module load cuda nccl 2>/dev/null || true
+# CUDA 12.x for H100 (sm_90). PyTorch 2.5.1+cu121 wheel bundles its own
+# NCCL so no system nccl module needed — avoids version mismatch.
+module load cuda/12.6.1 2>/dev/null || true
 export NCCL_DEBUG=WARN
 # NVLink SHARP (NVLS) — defensive: auto-enabled on NCCL >= 2.17 + H100 NVSwitch
 export NCCL_NVLS_ENABLE=1

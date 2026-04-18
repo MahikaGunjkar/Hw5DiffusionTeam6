@@ -23,6 +23,16 @@ SLURM_TEMPLATE="${SCRIPT_DIR}/run.slurm"
 LOG_DIR="${REPO_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
 
+# Source env_ocean.sh on PSC login node so `python` points to conda env
+# (ruamel.yaml parsing in _slurm_field below needs it). No-op on local dev.
+if [ -f "${SCRIPT_DIR}/env_ocean.sh" ]; then
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/env_ocean.sh"
+fi
+
+# Python binary: prefer conda env, fall back to python3 for local dev.
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python || command -v python3)}"
+
 DRY_RUN=0
 IDS=()
 EXTRA_EXPORTS=""
@@ -75,7 +85,7 @@ echo ""
 # ── Tiny python helper to extract slurm block from yaml ──
 _slurm_field() {
     # usage: _slurm_field yaml_path key
-    python - <<PY
+    "${PYTHON_BIN}" - <<PY
 from ruamel.yaml import YAML
 d = YAML().load(open("$1"))
 print(d['slurm']['$2'])

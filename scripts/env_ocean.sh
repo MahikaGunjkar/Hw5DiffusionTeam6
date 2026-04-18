@@ -42,3 +42,17 @@ mkdir -p \
     "$WANDB_CONFIG_DIR" "$XDG_DATA_HOME" "$HF_HOME" "$HF_DATASETS_CACHE" \
     "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$PIP_CACHE_DIR" \
     "$UV_CACHE_DIR" "$CKPT_DIR" "$OUTPUT_DIR" "$TMPDIR" 2>/dev/null || true
+
+# ——— Conda env 激活（PSC bridges2）———
+# PSC AI/pytorch module uses CUDA 10.1 (too old for H100). We build our own
+# env on ocean: python 3.11 + torch 2.5.1 + cu121 + diffusers + wandb + FID.
+# Path is pre-populated by scripts/psc_conda_setup.sh (one-time bootstrap).
+export PSC_CONDA_ENV="${PSC_CONDA_ENV:-$PROJ_ROOT/envs/hw5diff}"
+export PSC_CONDA_BASE="${PSC_CONDA_BASE:-/opt/packages/anaconda3-2024.10-1}"
+
+# Only activate on PSC (has the anaconda3 install). Skip gracefully on local dev.
+if [ -f "$PSC_CONDA_BASE/etc/profile.d/conda.sh" ] && [ -d "$PSC_CONDA_ENV" ]; then
+    # shellcheck disable=SC1091
+    source "$PSC_CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "$PSC_CONDA_ENV"
+fi
