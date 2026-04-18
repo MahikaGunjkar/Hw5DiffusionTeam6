@@ -27,6 +27,7 @@ from utils import (
     save_checkpoint,
     extract_tar_if_needed,
 )
+from utils.training import create_grad_scaler, evaluation_mode, resolve_amp_config
 
 logger = get_logger(__name__)
 
@@ -362,6 +363,15 @@ def main():
         params += list(class_embedder.parameters())
 
     optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    amp_config = resolve_amp_config(device, args.mixed_precision)
+    grad_scaler = create_grad_scaler(amp_config)
+    if is_primary(args):
+        autocast_name = str(amp_config.autocast_dtype).replace("torch.", "") if amp_config.autocast_dtype else "disabled"
+        logger.info(
+            "AMP config: autocast=%s, grad_scaler=%s",
+            autocast_name,
+            amp_config.scaler_enabled,
+        )
 
     num_update_steps_per_epoch = len(train_loader)
     args.max_train_steps = args.num_epochs * num_update_steps_per_epoch
@@ -479,55 +489,64 @@ def main():
 
             optimizer.zero_grad()
 
-            # CFG class embeddings (with 10 % unconditional dropout inside ClassEmbedder)
-            class_emb = class_embedder(labels) if class_embedder is not None else None
+            with amp_config.autocast_context():
+                # CFG class embeddings (with 10 % unconditional dropout inside ClassEmbedder)
+                class_emb = class_embedder(labels) if class_embedder is not None else None
 
-            # ================= Forward + loss =================
-            if args.framework == 'flow_matching':
-                # Rectified Flow with optional OT pairing.
-                # Convention: t=0 -> noise, t=1 -> data; v* = x_1 - x_0.
-                x_1 = images                              # real latents
-                x_0 = torch.randn_like(images)            # pure Gaussian noise
-                x_0 = noise_scheduler.pair_ot(x_0, x_1)   # identity if use_ot=False
+                # ================= Forward + loss =================
+                if args.framework == 'flow_matching':
+                    # Rectified Flow with optional OT pairing.
+                    # Convention: t=0 -> noise, t=1 -> data; v* = x_1 - x_0.
+                    x_1 = images                              # real latents
+                    x_0 = torch.randn_like(images)            # pure Gaussian noise
+                    x_0 = noise_scheduler.pair_ot(x_0, x_1)   # identity if use_ot=False
 
-                t = torch.rand(batch_size, device=device)
-                x_t = noise_scheduler.interpolate(x_0, x_1, t)
-                target = noise_scheduler.velocity_target(x_0, x_1)
+                    t = torch.rand(batch_size, device=device)
+                    x_t = noise_scheduler.interpolate(x_0, x_1, t)
+                    target = noise_scheduler.velocity_target(x_0, x_1)
 
-                # UNet uses a discrete timestep embedding table; rescale
-                # continuous t -> integer index. DiT accepts continuous t.
-                if args.model_type == 'unet':
-                    t_in = (t * args.num_train_timesteps).long().clamp(
-                        0, args.num_train_timesteps - 1)
+                    # UNet uses a discrete timestep embedding table; rescale
+                    # continuous t -> integer index. DiT accepts continuous t.
+                    if args.model_type == 'unet':
+                        t_in = (t * args.num_train_timesteps).long().clamp(
+                            0, args.num_train_timesteps - 1)
+                    else:
+                        t_in = t
+
+                    model_pred = unet(x_t, t_in, c=class_emb)
+                    loss = F.mse_loss(model_pred, target)
                 else:
-                    t_in = t
+                    # Standard DDPM epsilon-prediction baseline.
+                    noise = torch.randn_like(images)
+                    timesteps = torch.randint(
+                        0, args.num_train_timesteps, (batch_size,), device=device
+                    ).long()
+                    noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
 
-                model_pred = unet(x_t, t_in, c=class_emb)
-                loss = F.mse_loss(model_pred, target)
-            else:
-                # Standard DDPM epsilon-prediction baseline.
-                noise = torch.randn_like(images)
-                timesteps = torch.randint(
-                    0, args.num_train_timesteps, (batch_size,), device=device
-                ).long()
-                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+                    model_pred = unet(noisy_images, timesteps, c=class_emb)
 
-                model_pred = unet(noisy_images, timesteps, c=class_emb)
+                    if args.prediction_type == 'epsilon':
+                        target = noise
+                    else:
+                        raise NotImplementedError(
+                            f"prediction_type {args.prediction_type} not supported."
+                        )
 
-                if args.prediction_type == 'epsilon':
-                    target = noise
-                else:
-                    raise NotImplementedError(
-                        f"prediction_type {args.prediction_type} not supported."
-                    )
-
-                loss = F.mse_loss(model_pred, target)
+                    loss = F.mse_loss(model_pred, target)
             loss_m.update(loss.item())
 
-            loss.backward()
-            if args.grad_clip:
-                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
-            optimizer.step()
+            if grad_scaler.is_enabled():
+                grad_scaler.scale(loss).backward()
+                if args.grad_clip:
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                optimizer.step()
             lr_scheduler.step()
             ema.update(unet_wo_ddp)
             progress_bar.update(1)
@@ -542,41 +561,40 @@ def main():
 
         # ===================== Epoch-end: Sample & Save =====================
         ema.apply_shadow(unet_wo_ddp)
-        unet.eval()
+        with evaluation_mode(unet, class_embedder):
+            generator = torch.Generator(device=device)
+            generator.manual_seed(epoch + args.seed)
 
-        generator = torch.Generator(device=device)
-        generator.manual_seed(epoch + args.seed)
-
-        infer_steps = (
-            args.num_inference_steps_flow
-            if args.framework == 'flow_matching'
-            else args.num_inference_steps
-        )
-
-        if args.use_cfg:
-            classes = torch.randint(0, args.num_classes, (4,), device=device)
-            gen_images = pipeline(
-                batch_size=4,
-                num_inference_steps=infer_steps,
-                classes=classes.tolist(),
-                guidance_scale=args.cfg_guidance_scale,
-                generator=generator,
-                device=device,
-            )
-        else:
-            gen_images = pipeline(
-                batch_size=4,
-                num_inference_steps=infer_steps,
-                generator=generator,
-                device=device,
+            infer_steps = (
+                args.num_inference_steps_flow
+                if args.framework == 'flow_matching'
+                else args.num_inference_steps
             )
 
-        grid_image = Image.new('RGB', (4 * args.image_size, args.image_size))
-        for i, image in enumerate(gen_images):
-            grid_image.paste(image, (i * args.image_size, 0))
+            if args.use_cfg:
+                classes = torch.randint(0, args.num_classes, (4,), device=device)
+                gen_images = pipeline(
+                    batch_size=4,
+                    num_inference_steps=infer_steps,
+                    classes=classes.tolist(),
+                    guidance_scale=args.cfg_guidance_scale,
+                    generator=generator,
+                    device=device,
+                )
+            else:
+                gen_images = pipeline(
+                    batch_size=4,
+                    num_inference_steps=infer_steps,
+                    generator=generator,
+                    device=device,
+                )
 
-        if is_primary(args):
-            wandb_logger.log({'gen_images': wandb.Image(grid_image)})
+            grid_image = Image.new('RGB', (4 * args.image_size, args.image_size))
+            for i, image in enumerate(gen_images):
+                grid_image.paste(image, (i * args.image_size, 0))
+
+            if is_primary(args):
+                wandb_logger.log({'gen_images': wandb.Image(grid_image)})
 
         ema.restore(unet_wo_ddp)
 

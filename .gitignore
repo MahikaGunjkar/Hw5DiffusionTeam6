@@ -17,3 +17,6 @@ wandb/
 *.zip
 generated_images/
 submission.csv
+.env
+.env.*
+!.env.example

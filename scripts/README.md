@@ -97,9 +97,13 @@ them on a single interactive GPU once the DiT-B / UNet training completes:
 
 ```bash
 srun --gpus=v100-32:1 --time=2:00:00 --pty bash
-bash scripts/infer_sweep.sh outputs/exp-XX-exp03/checkpoints/ckpt_final.pt dit_b
-bash scripts/infer_sweep.sh outputs/exp-XX-exp15/checkpoints/ckpt_final.pt unet
+bash scripts/infer_sweep.sh outputs/exp-XX-exp03/checkpoints/checkpoint_epoch_299.pth dit_b
+bash scripts/infer_sweep.sh outputs/exp-XX-exp15/checkpoints/checkpoint_epoch_199.pth unet
 ```
+
+`infer_sweep.sh` will automatically reuse the sibling `config.yaml` saved by
+`train.py`, so the sweep inherits the original `use_cfg`, scheduler, latent,
+and architecture settings instead of silently rebuilding from the base config.
 
 ## NVLink verification
 

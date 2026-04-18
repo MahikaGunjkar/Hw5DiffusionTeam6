@@ -9,29 +9,51 @@
 # Usage (from the repo root):
 #
 #   # DiT-B checkpoint sweep (Exp 10, 11, 12, 13)
-#   scripts/infer_sweep.sh outputs/exp-XX-exp03/checkpoints/ckpt_final.pt dit_b
+#   scripts/infer_sweep.sh outputs/exp-XX-exp03/checkpoints/checkpoint_epoch_299.pth dit_b
 #
 #   # UNet checkpoint sweep (Exp 17, 18)
-#   scripts/infer_sweep.sh outputs/exp-XX-exp15/checkpoints/ckpt_final.pt unet
-#   scripts/infer_sweep.sh outputs/exp-XX-exp16/checkpoints/ckpt_final.pt unet
+#   scripts/infer_sweep.sh outputs/exp-XX-exp15/checkpoints/checkpoint_epoch_199.pth unet
+#   scripts/infer_sweep.sh outputs/exp-XX-exp16/checkpoints/checkpoint_epoch_199.pth unet
 
 set -euo pipefail
 
 CKPT="${1:?usage: $0 CKPT_PATH MODEL_TYPE}"
 MODEL_TYPE="${2:?usage: $0 CKPT_PATH MODEL_TYPE}"
+TRAIN_CFG="${3:-}"
+
+if [[ -z "${TRAIN_CFG}" ]]; then
+    EXP_DIR="$(cd "$(dirname "${CKPT}")/.." && pwd)"
+    AUTO_CFG="${EXP_DIR}/config.yaml"
+    if [[ -f "${AUTO_CFG}" ]]; then
+        TRAIN_CFG="${AUTO_CFG}"
+    fi
+fi
 
 run_infer() {
     local label="$1"
     shift
+    local cmd=(
+        python inference.py
+        --config configs/ddpm.yaml
+    )
+    if [[ -n "${TRAIN_CFG}" ]]; then
+        cmd+=( "${TRAIN_CFG}" )
+    fi
+    cmd+=(
+        --ckpt "${CKPT}"
+        --model_type "${MODEL_TYPE}"
+        --run_name "${label}"
+    )
+    cmd+=( "$@" )
     echo "=========================================================="
     echo "[${label}] extra args: $*"
     echo "=========================================================="
-    python inference.py \
-        --config configs/ddpm.yaml \
-        --ckpt "${CKPT}" \
-        --model_type "${MODEL_TYPE}" \
-        --run_name "${label}" \
-        "$@"
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        printf '%q ' "${cmd[@]}"
+        printf '\n'
+    else
+        "${cmd[@]}"
+    fi
 }
 
 if [[ "${MODEL_TYPE}" == dit* ]]; then
