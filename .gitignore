@@ -7,6 +7,7 @@ dataset_extracted/
 AGENTS.md
 CLAUDE.md
 pretrained/
+Deepthink.md
 experiments/
 __pycache__/
 *.pyc
