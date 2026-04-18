@@ -20,6 +20,7 @@ from typing import Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.optimize import linear_sum_assignment
 
 
 class RectifiedFlowScheduler(nn.Module):
@@ -114,8 +115,6 @@ class RectifiedFlowScheduler(nn.Module):
                 "Switch to Sinkhorn (e.g. via POT's `ot.sinkhorn`) for large batches."
             )
 
-        from scipy.optimize import linear_sum_assignment
-
         with torch.no_grad():
             x_0_flat = x_0.reshape(batch_size, -1).float()
             x_1_flat = x_1.reshape(batch_size, -1).float()
@@ -157,9 +156,14 @@ class RectifiedFlowScheduler(nn.Module):
     def add_noise(
         self, original_samples: torch.Tensor, noise: torch.Tensor, t: torch.Tensor
     ) -> torch.Tensor:
-        """Shim so existing ``scheduler.add_noise(x_1, noise, t)`` calls work.
+        """Intentionally not implemented.
 
-        Rectified Flow does not add Gaussian noise; we interpret this as
-        ``interpolate(noise, original_samples, t)`` for API parity.
+        DDPM's ``add_noise(x_0, noise, t)`` has *t large = noisier* semantics.
+        Rectified Flow's ``interpolate(x_0=noise, x_1=data, t)`` has the
+        *opposite* convention (t large = more data). A silent shim mapping
+        the two would be a footgun; callers must use ``interpolate`` directly.
         """
-        return self.interpolate(noise, original_samples, t)
+        raise NotImplementedError(
+            "RectifiedFlowScheduler has reversed t semantics vs DDPM. "
+            "Use scheduler.interpolate(x_0=noise, x_1=data, t) explicitly."
+        )

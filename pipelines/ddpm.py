@@ -126,8 +126,8 @@ class DDPMPipeline:
 
         # ---- Decode from latent space if using VAE ----
         if self.vae is not None:
-            # Undo the 0.1845 scaling applied during encoding
-            image = self.vae.decode(image / 0.1845)
+            # Undo the VAE.scaling_factor scaling applied during encoding
+            image = self.vae.decode(image / self.vae.scaling_factor)
             image = image.clamp(-1.0, 1.0)
 
         # ---- Rescale [-1, 1] -> [0, 1] ----

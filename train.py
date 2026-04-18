@@ -1,7 +1,6 @@
 import os
 import sys
 import copy
-import tarfile
 import argparse
 import numpy as np
 import ruamel.yaml as yaml
@@ -19,69 +18,17 @@ from torchvision.utils import make_grid
 from models import UNet, VAE, ClassEmbedder, build_dit
 from schedulers import DDPMScheduler, DDIMScheduler, RectifiedFlowScheduler
 from pipelines import DDPMPipeline, FlowMatchingPipeline
-from utils import seed_everything, init_distributed_device, is_primary, AverageMeter, str2bool, save_checkpoint
+from utils import (
+    seed_everything,
+    init_distributed_device,
+    is_primary,
+    AverageMeter,
+    str2bool,
+    save_checkpoint,
+    extract_tar_if_needed,
+)
 
 logger = get_logger(__name__)
-
-
-# ===================== Tar Extraction Helper =====================
-
-def extract_tar_if_needed(tar_path: str, extract_to: str) -> str:
-    """
-    Stream-extract a .tar.gz archive into `extract_to` if not already done.
-    A hidden `.extracted` flag file is written so repeated runs skip extraction.
-
-    Expected archive layout:
-        imagenet100_128x128/
-            train/
-                class_folder_0/  *.JPEG
-                class_folder_1/  ...
-            val/
-                class_folder_0/  *.JPEG
-                ...
-
-    Returns the path to the train/ split inside the extracted directory.
-    """
-    flag = os.path.join(extract_to, ".extracted")
-    if os.path.exists(flag):
-        logger.info(f"Dataset already extracted at '{extract_to}' — skipping extraction.")
-    else:
-        if not os.path.exists(tar_path):
-            raise FileNotFoundError(
-                f"Tar file not found: '{tar_path}'\n"
-                "Please set --tar_path to point at imagenet100_128x128.tar.gz"
-            )
-        os.makedirs(extract_to, exist_ok=True)
-        logger.info(f"Extracting '{tar_path}' → '{extract_to}' (streaming, no temp copy) ...")
-
-        with tarfile.open(tar_path, "r:gz") as tar:
-            members = tar.getmembers()
-            total = len(members)
-            for i, member in enumerate(members):
-                tar.extract(member, extract_to, set_attrs=False)
-                if i % 10_000 == 0 and i > 0:
-                    logger.info(f"  Extraction progress: {i}/{total} ({100*i/total:.1f}%)")
-
-        # Write flag so we skip next time
-        with open(flag, "w") as f:
-            f.write("done")
-        logger.info("Extraction complete.")
-
-    # Auto-detect the root folder inside the archive
-    # Could be 'imagenet100_128x128/', or directly 'train/', etc.
-    for candidate in [
-        os.path.join(extract_to, "imagenet100_128x128"),
-        os.path.join(extract_to, "imagenet100"),
-        extract_to,
-    ]:
-        train_candidate = os.path.join(candidate, "train")
-        if os.path.isdir(train_candidate):
-            return train_candidate
-
-    raise RuntimeError(
-        f"Could not find a 'train/' subfolder inside '{extract_to}'. "
-        "Please check the archive structure."
-    )
 
 
 # ===================== EMA Helper =====================
@@ -519,7 +466,16 @@ def main():
             if vae:
                 with torch.no_grad():
                     images = vae.encode(images)
-                images = images * 0.1845   # scale to ~unit std
+                images = images * vae.scaling_factor   # scale to ~unit std
+
+            # Deterministic per-step seed so the DiT mask sampling
+            # (models/dit.py::_apply_mask) is reproducible across runs and
+            # distinct across ranks. Offset by rank so each DDP worker masks
+            # its own micro-batch differently.
+            global_step = epoch * num_update_steps_per_epoch + step
+            torch.manual_seed(
+                args.seed + global_step * max(args.world_size, 1) + args.rank
+            )
 
             optimizer.zero_grad()
 

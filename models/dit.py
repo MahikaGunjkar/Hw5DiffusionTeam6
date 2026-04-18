@@ -15,7 +15,8 @@ need to branch on model type:
 
 with ``x: (B, C, H, W)``, ``t: (B,) float in [0, 1]``, and ``c`` optional
 class-conditioning already emitted by :class:`ClassEmbedder` — its
-``embed_dim`` MUST equal ``hidden_size`` (enforced with an ``assert``).
+``embed_dim`` should equal ``hidden_size``; otherwise a ``c_proj`` Linear
+is inserted automatically.
 """
 
 from __future__ import annotations
@@ -225,7 +226,8 @@ class AsymmetricMaskedDiT(nn.Module):
 
         num_patches = self.x_embedder.num_patches
         pos_embed = _build_2d_sincos_posembed(hidden_size, self.x_embedder.grid_size)
-        self.register_buffer("pos_embed", pos_embed.unsqueeze(0))  # (1, N, D)
+        # persistent=False: pos_embed is deterministic from grid_size, no need to save in ckpt
+        self.register_buffer("pos_embed", pos_embed.unsqueeze(0), persistent=False)  # (1, N, D)
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
 
@@ -291,20 +293,25 @@ class AsymmetricMaskedDiT(nn.Module):
             we convert to flow-time via ``t_flow = 1 - t / T`` before applying
             the schedule.
         """
+        # Training-time gate FIRST — inference must never drop patches,
+        # regardless of const_mask_ratio / use_ada_mask flags.
+        if not self.training:
+            return 0.0
         if self.const_mask_ratio is not None:
             return float(self.const_mask_ratio)
-        if not self.use_ada_mask or not self.training:
+        if not self.use_ada_mask:
             return 0.0
 
-        t_float = t.float()
-        if t_float.max().item() > 1.0:
-            # DDPM-style: convert to flow-time (invert the noise axis).
-            t_float = 1.0 - t_float / float(self.num_train_timesteps_ref)
-
-        t_mean = float(t_float.mean().item())
+        # Use first sample's t as a proxy to avoid a batch-wide reduce sync.
+        # Since the schedule is smooth and t is i.i.d. across the batch,
+        # sampling a single t per step is an unbiased estimate of the mean.
+        t0_host = float(t.flatten()[0].detach().item())
+        if t0_host > 1.0:
+            # DDPM-style integer timestep: invert to flow-time.
+            t0_host = 1.0 - t0_host / float(self.num_train_timesteps_ref)
         # Clamp defensively in case of numerical drift above [0, 1].
-        t_mean = max(0.0, min(1.0, t_mean))
-        return self.ada_mask_max * math.cos(math.pi * t_mean / 2.0) ** 2
+        t0_host = max(0.0, min(1.0, t0_host))
+        return self.ada_mask_max * math.cos(math.pi * t0_host / 2.0) ** 2
 
     def _apply_mask(
         self,
@@ -370,6 +377,12 @@ class AsymmetricMaskedDiT(nn.Module):
 
         # ---- Unmask + shallow decoder ----
         x_full = self._unmask(x_enc, ids_restore) if ids_restore is not None else x_enc
+        if ids_restore is not None:
+            # MAE-style: re-add position embedding to all tokens (incl. mask
+            # tokens) so the decoder can distinguish spatial positions. Without
+            # this, mask tokens are identical across positions and the decoder
+            # cannot reconstruct geometry.
+            x_full = x_full + self.pos_embed
         for blk in self.decoder_blocks:
             x_full = blk(x_full, c_emb)
 

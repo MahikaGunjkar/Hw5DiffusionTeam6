@@ -7,6 +7,11 @@ from .vae_distributions import DiagonalGaussianDistribution
 
 
 class VAE(nn.Module):
+    # Single source of truth for the latent scaling factor used in
+    # train.py (encode) and the DDPM / Flow pipelines (decode). Empirically
+    # chosen so that VAE latents have ~unit std, matching DDPM's noise scale.
+    scaling_factor: float = 0.1845
+
     # NOTE: do not change anything in __init__ function
     def __init__(self,
                  ### Encoder Decoder Related

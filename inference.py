@@ -1,31 +1,16 @@
 import os
-import sys
 import torch
 
-# ── Patch torch.load for PyTorch 2.6 compatibility ──────────────────────────
-_real_load = torch.load
-def _load_patch(f, map_location=None, pickle_module=None, weights_only=None, **kwargs):
-    return _real_load(f, map_location=map_location, weights_only=False, **kwargs)
-torch.load = _load_patch
-# ─────────────────────────────────────────────────────────────────────────────
-
-import argparse
-import numpy as np
-import ruamel.yaml as yaml
-import wandb
 import logging
 from logging import getLogger as get_logger
 from tqdm import tqdm
-from PIL import Image
-import torch.nn.functional as F
 
 from torchvision import datasets, transforms
-from torchvision.utils import make_grid
 
 from models import UNet, VAE, ClassEmbedder, build_dit
 from schedulers import DDPMScheduler, DDIMScheduler, RectifiedFlowScheduler
 from pipelines import DDPMPipeline, FlowMatchingPipeline
-from utils import seed_everything, load_checkpoint
+from utils import seed_everything, extract_tar_if_needed
 
 from train import parse_args
 
@@ -147,24 +132,26 @@ def main():
     # Load checkpoint — uses patched load_checkpoint (skips scheduler state)
     assert args.ckpt is not None, "Please provide --ckpt"
 
-    # Inline load to avoid scheduler size mismatch
-    print("loading checkpoint")
-    ckpt = torch.load(args.ckpt, weights_only=False)
-    print("loading unet")
+    # Inline load to avoid scheduler size mismatch.
+    # weights_only=False is scoped to these two known local training
+    # artifacts (produced by train.py); do not extend to untrusted inputs.
+    logger.info("Loading checkpoint")
+    ckpt = torch.load(args.ckpt, weights_only=False, map_location="cpu")
+    logger.info("Loading unet")
     unet.load_state_dict(ckpt['unet_state_dict'])
-    print("skipping scheduler (rebuilt from args)")
+    logger.info("Skipping scheduler (rebuilt from args)")
     if vae is not None and 'vae_state_dict' in ckpt:
-        print("loading vae")
+        logger.info("Loading vae")
         vae.load_state_dict(ckpt['vae_state_dict'])
     if class_embedder is not None and 'class_embedder_state_dict' in ckpt:
-        print("loading class_embedder")
+        logger.info("Loading class_embedder")
         class_embedder.load_state_dict(ckpt['class_embedder_state_dict'])
 
     # Load EMA weights if available
     ema_ckpt_path = args.ckpt.replace('checkpoint_epoch_', 'ema_checkpoint_epoch_')
     if os.path.exists(ema_ckpt_path):
         logger.info(f"Loading EMA weights from {ema_ckpt_path}")
-        ema_data = torch.load(ema_ckpt_path, weights_only=False)
+        ema_data = torch.load(ema_ckpt_path, weights_only=False, map_location="cpu")
         for name, param in unet.named_parameters():
             if name in ema_data.get('ema_shadow', {}):
                 param.data.copy_(ema_data['ema_shadow'][name].to(device))
@@ -241,7 +228,18 @@ def main():
         transforms.Resize((args.image_size, args.image_size)),
         transforms.ToTensor(),
     ])
-    ref_dataset = datasets.ImageFolder(root=args.data_dir, transform=ref_transform)
+
+    # Resolve reference data directory — support both --tar_path and --data_dir.
+    if args.data_dir is not None and os.path.isdir(args.data_dir):
+        ref_dir = args.data_dir
+    elif getattr(args, "tar_path", None):
+        ref_dir = extract_tar_if_needed(args.tar_path, args.extract_dir)
+    else:
+        raise ValueError(
+            "FID needs a reference dataset. Provide --data_dir (extracted "
+            "train/) or --tar_path (imagenet100_128x128.tar.gz)."
+        )
+    ref_dataset = datasets.ImageFolder(root=ref_dir, transform=ref_transform)
     ref_loader = torch.utils.data.DataLoader(
         ref_dataset, batch_size=64, shuffle=False, num_workers=4
     )

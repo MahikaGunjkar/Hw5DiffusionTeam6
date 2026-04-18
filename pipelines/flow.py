@@ -117,9 +117,10 @@ class FlowMatchingPipeline:
             )
 
             if solver == "heun":
-                # Predictor step
+                # Predictor step. timesteps are constructed by linspace so
+                # that t + dt <= 1 always holds; no clamp needed.
                 x_pred = image + v1 * dt
-                t_next = torch.clamp(t_batch + dt, max=1.0)
+                t_next = t_batch + dt
                 v2 = self._model_velocity(
                     x_pred, t_next, class_embeds, uncond_embeds, use_cfg, guidance_scale
                 )
@@ -129,7 +130,7 @@ class FlowMatchingPipeline:
 
         # ---- VAE decode (if latent) ----
         if self.vae is not None:
-            image = self.vae.decode(image / 0.1845)
+            image = self.vae.decode(image / self.vae.scaling_factor)
             image = image.clamp(-1.0, 1.0)
 
         # ---- Rescale [-1, 1] -> [0, 1] and convert to PIL ----
