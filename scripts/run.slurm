@@ -15,7 +15,10 @@
 set -euo pipefail
 
 # ——— PSC ocean 环境变量（必须在 module load 之前 source）———
-source "$(dirname "$0")/env_ocean.sh"
+# SLURM copies sbatch script to /var/spool/slurm/d/job<id>/ before exec, so
+# $0 is spool path — dirname gives wrong dir. Use SLURM_SUBMIT_DIR.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-/ocean/projects/cis260133p/zjiang9/Hw5DiffusionTeam6}"
+source "${REPO_ROOT}/scripts/env_ocean.sh"
 
 # Pre-flight: verify wandb auth BEFORE allocating GPU time (plan 决策 5.1)
 if [ -z "${WANDB_API_KEY:-}" ] && [ ! -f "$HOME/.netrc" ]; then

@@ -15,7 +15,11 @@
 
 set -euo pipefail
 
-source "$(dirname "$0")/env_ocean.sh"
+# SLURM copies sbatch script to /var/spool/slurm/d/job<id>/ before exec, so
+# $0 is NOT the original path. Use SLURM_SUBMIT_DIR (user's CWD at sbatch time)
+# with a hardcoded fallback to the repo on ocean.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-/ocean/projects/cis260133p/zjiang9/Hw5DiffusionTeam6}"
+source "${REPO_ROOT}/scripts/env_ocean.sh"
 
 if [ -z "${WANDB_API_KEY:-}" ] && [ ! -f "$HOME/.netrc" ]; then
     echo "FATAL: wandb not authenticated" >&2
