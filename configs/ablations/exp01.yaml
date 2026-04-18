@@ -2,8 +2,9 @@
 slurm:
   node: h100-80
   gpus: 8
-  time: "09:00:00"
+  time: "12:00:00"
   # wall-clock 估算: DiT-XL Ada75% @ H100 0.15 GPUh/ep, 400ep × 0.15 / 8 × 1.2 = 9h
+  # 用户要求 12h (2026-04-18)：留 3h buffer 吸收 data extract + wandb artifact 上传 + backfill 抖动
 
 framework: flow_matching
 use_ot: true
