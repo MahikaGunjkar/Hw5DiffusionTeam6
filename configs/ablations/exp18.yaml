@@ -1,0 +1,20 @@
+# Exp 18 — DiT-XL, OT-AdaMask 75%, Heun, NFE 10, 200ep (The Giant Run: 进入大厂 Foundation 区间)
+# Deepthink Row 18: OT+AdaMask 赋能 DiT-XL, 预期 Exc. FID/IS
+# wall-clock 估算: DiT-XL Ada75% ≈ 1.6 GPUh/ep (4× DiT-B × 0.4), 200ep × 1.6 / 8 GPU × 1.2 = 48h
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "05:00:00"
+  # wall-clock 估算: DiT-XL Ada75% @ H100 0.15 GPUh/ep, 200ep × 0.15 / 8 × 1.2 = 4.5h → 5h
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_xl
+use_ada_mask: true
+ada_mask_max: 0.75
+num_epochs: 200
+batch_size: 8
+learning_rate: 0.0003
+flow_solver: heun
+num_inference_steps_flow: 10

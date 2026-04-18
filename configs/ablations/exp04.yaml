@@ -1,8 +1,9 @@
 # Exp 04 — DiT-S Scaling Law lower point
 slurm:
-  node: v100-32
+  node: h100-80
   gpus: 8
-  time: "16:00:00"
+  time: "01:00:00"
+  # wall-clock 估算: DiT-S Ada75% @ H100 0.02 GPUh/ep, 300ep × 0.02 / 8 × 1.2 = 0.9h → 1h
 
 framework: flow_matching
 use_ot: true

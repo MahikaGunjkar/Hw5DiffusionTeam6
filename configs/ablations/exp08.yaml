@@ -1,8 +1,9 @@
 # Exp 08 — DecDepth=0 (asymmetric decoder necessity)
 slurm:
-  node: v100-32
+  node: h100-80
   gpus: 8
-  time: "48:00:00"
+  time: "01:00:00"
+  # wall-clock 估算: DiT-B Ada75% @ H100 0.02 GPUh/ep, 300ep × 0.02 / 8 × 1.2 = 0.9h → 1h
 
 framework: flow_matching
 use_ot: true

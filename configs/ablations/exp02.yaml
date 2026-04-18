@@ -2,7 +2,8 @@
 slurm:
   node: h100-80
   gpus: 8
-  time: "40:00:00"
+  time: "02:00:00"
+  # wall-clock 估算: DiT-L Ada75% @ H100 0.06 GPUh/ep, 200ep × 0.06 / 8 × 1.2 = 1.8h → 2h
 
 framework: flow_matching
 use_ot: true

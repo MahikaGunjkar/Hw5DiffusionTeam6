@@ -1,0 +1,21 @@
+# Exp 13 — DiT-L, OT-AdaMask 75%, Heun, NFE 10 (突破参数天花板: 4亿参数可接受区间)
+# Deepthink Row 13: SOTA-L, 验证 OT+AdaMask 对 DiT-L 规模的有效性
+# NOTE: 原表格 500ep, 但 DiT-L Ada75% ≈ 0.8 GPUh/ep, 500ep/8GPU×1.2 = 60h > 48h 上限
+# 压缩至 300ep: 0.8×300/8×1.2 = 36h, 在预算范围内
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "03:00:00"
+  # wall-clock 估算: DiT-L Ada75% @ H100 0.06 GPUh/ep, 300ep × 0.06 / 8 × 1.2 = 2.7h → 3h
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_l
+use_ada_mask: true
+ada_mask_max: 0.75
+num_epochs: 300
+batch_size: 16
+learning_rate: 0.0003
+flow_solver: heun
+num_inference_steps_flow: 10

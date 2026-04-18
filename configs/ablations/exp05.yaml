@@ -1,8 +1,9 @@
 # Exp 05 — Const 50% mask vs AdaMask schedule
 slurm:
-  node: v100-32
+  node: h100-80
   gpus: 8
-  time: "36:00:00"
+  time: "03:00:00"
+  # wall-clock 估算: DiT-B no_ada_mask @ H100 0.06 GPUh/ep, 300ep × 0.06 / 8 × 1.2 = 2.7h → 3h
 
 framework: flow_matching
 use_ot: true

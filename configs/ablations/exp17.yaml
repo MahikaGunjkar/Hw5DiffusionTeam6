@@ -1,0 +1,19 @@
+# Exp 17 — DiT-XL, NO OT, no mask, Heun, NFE 10 (XL反面教材: 证明传统路线在XL规模走不通)
+# Deepthink Row 17: XL 级无 Mask 基线, 对照 exp18 暴露 OT+AdaMask 的必要性
+# wall-clock 估算: DiT-XL 无掩码 ≈ 3.2 GPUh/ep (4× DiT-B), 100ep × 3.2 / 8 GPU × 1.2 = 48h
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "06:00:00"
+  # wall-clock 估算: DiT-XL no_mask @ H100 0.40 GPUh/ep, 100ep × 0.40 / 8 × 1.2 = 6h
+
+framework: flow_matching
+use_ot: false
+use_cfg: true
+model_type: dit_xl
+use_ada_mask: false
+num_epochs: 100
+batch_size: 8
+learning_rate: 0.0003
+flow_solver: heun
+num_inference_steps_flow: 10

@@ -7,7 +7,9 @@ import ruamel.yaml as yaml
 import torch
 import wandb
 import logging
+from datetime import timedelta
 from logging import getLogger as get_logger
+from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
 import torch.nn.functional as F
@@ -25,9 +27,13 @@ from utils import (
     AverageMeter,
     str2bool,
     save_checkpoint,
+    save_checkpoint_atomic,
     extract_tar_if_needed,
 )
+from utils.checkpoint import load_checkpoint
 from utils.training import create_grad_scaler, evaluation_mode, resolve_amp_config
+# fid_utils is imported lazily inside the FID evaluation block to avoid
+# crashing --help when torchmetrics/transformers versions mismatch.
 
 logger = get_logger(__name__)
 
@@ -71,7 +77,7 @@ class EMA:
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a DDPM model.")
 
-    # config file(s) — later files override earlier ones, so an ablation
+    # config file(s) - later files override earlier ones, so an ablation
     # YAML can ship only the deltas from the base config.
     parser.add_argument("--config", type=str, nargs='+', default=['configs/ddpm.yaml'],
                         help="One or more YAML config files; later override earlier.")
@@ -160,7 +166,40 @@ def parse_args():
     # ---- Checkpoint (inference) ----
     parser.add_argument("--ckpt", type=str, default=None)
 
-    # First parse — get config file path
+    # ---- Wandb ----
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Wandb entity (team or user slug). Overrides yaml.")
+    parser.add_argument("--wandb_project", type=str, default='ddpm',
+                        help="Wandb project name.")
+
+    # ---- Resume ----
+    parser.add_argument("--resume_enabled", type=str2bool, default=False,
+                        help="Download artifact from wandb and resume training.")
+    parser.add_argument("--wandb_resume", type=str,
+                        choices=['allow', 'must', 'never', 'auto'], default='allow',
+                        help="Wandb run resume mode passed to wandb.init.")
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Wandb run ID to resume. Env WANDB_RUN_ID takes priority.")
+    parser.add_argument("--wandb_ckpt_run_path", type=str, default=None,
+                        help="entity/project/run_id for artifact download on resume.")
+    parser.add_argument("--wandb_ckpt_alias", type=str, default='latest',
+                        help="Artifact alias to pull on resume, e.g. latest/best.")
+    parser.add_argument("--wandb_ckpt_cache_dir", type=str, default=None,
+                        help="Local dir for artifact download cache.")
+
+    # ---- Checkpoint saving ----
+    parser.add_argument("--save_every_n_epochs", type=int, default=5,
+                        help="Upload wandb artifact every N epochs.")
+
+    # ---- FID evaluation ----
+    parser.add_argument("--fid_every_n_epochs", type=int, default=10,
+                        help="Compute FID every N epochs (0 = disabled).")
+    parser.add_argument("--fid_num_samples", type=int, default=2048,
+                        help="Number of generated samples for FID computation.")
+    parser.add_argument("--fid_ref_stats_path", type=str, default=None,
+                        help="Path to reference .npz stats file. Auto-computed on first run if None.")
+
+    # First parse - get config file path
     args = parser.parse_args()
 
     # Load YAML config and set as new defaults
@@ -170,12 +209,12 @@ def parse_args():
         for cfg_path in args.config:
             with open(cfg_path, 'r', encoding='utf-8') as f:
                 cfg = file_yaml.load(f) or {}
-            # Strip the `slurm:` block — it is only for scripts/submit.sh.
+            # Strip the `slurm:` block - it is only for scripts/submit.sh.
             cfg.pop('slurm', None)
             merged.update(cfg)
         parser.set_defaults(**merged)
 
-    # Re-parse — command-line overrides YAML
+    # Re-parse - command-line overrides YAML
     args = parser.parse_args()
 
     # Auto-override UNet config when using latent DDPM
@@ -184,6 +223,40 @@ def parse_args():
         args.unet_in_ch = 3
 
     return args
+
+
+# ===================== Resume Helper =====================
+
+def _resume_from_wandb_artifact(args, unet, scheduler, vae, class_embedder, optimizer):
+    """
+    Download checkpoint artifact from wandb and load it.
+    Returns start_epoch (int): the epoch to resume from (saved_epoch + 1).
+    """
+    if not args.wandb_ckpt_run_path:
+        logger.warning("resume_enabled=True but wandb_ckpt_run_path is not set. Starting from epoch 0.")
+        return 0
+
+    cache_dir = args.wandb_ckpt_cache_dir or './wandb_resume_cache'
+    artifact_name = f"{args.wandb_ckpt_run_path}:{args.wandb_ckpt_alias}"
+    logger.info(f"Downloading artifact {artifact_name} to {cache_dir}")
+
+    try:
+        api = wandb.Api()
+        artifact = api.artifact(artifact_name)
+        ckpt_dir = artifact.download(root=cache_dir)
+        # Find the checkpoint file inside the artifact directory
+        ckpt_files = list(Path(ckpt_dir).glob('*.pth'))
+        if not ckpt_files:
+            raise FileNotFoundError(f"No .pth file found in artifact download dir: {ckpt_dir}")
+        ckpt_path = str(ckpt_files[0])
+        logger.info(f"Loaded artifact checkpoint: {ckpt_path}")
+        saved_epoch = load_checkpoint(unet, scheduler, vae, class_embedder, optimizer, ckpt_path)
+        start_epoch = saved_epoch + 1
+        logger.info(f"Resuming from epoch {start_epoch}")
+        return start_epoch
+    except Exception as exc:
+        logger.error(f"Resume artifact download failed: {exc}. Starting from epoch 0.")
+        return 0
 
 
 # ===================== Main =====================
@@ -438,8 +511,53 @@ def main():
             file_yaml = yaml.YAML()
             file_yaml.dump(experiment_config, f)
 
+    # ===================== Wandb Init =====================
     if is_primary(args):
-        wandb_logger = wandb.init(project='ddpm', name=args.run_name, config=vars(args))
+        # env var takes priority over argparse (resume / CI injection)
+        run_id = os.environ.get("WANDB_RUN_ID") or args.wandb_run_id
+        resume = os.environ.get("WANDB_RESUME") or args.wandb_resume
+        wandb_logger = wandb.init(
+            entity=args.wandb_entity,
+            project=args.wandb_project,
+            name=args.run_name,
+            id=run_id,
+            resume=resume,
+            config=vars(args),
+            dir=os.environ.get("WANDB_DIR"),
+            tags=[args.model_type, args.framework,
+                  f"exp{os.environ.get('EXP_ID', 'local')}"],
+        )
+        # Step monotonicity - rules/ml-training-wandb.md section 1
+        wandb_logger.define_metric("global_step")
+        wandb_logger.define_metric("train/*", step_metric="global_step")
+        wandb_logger.define_metric("val/*", step_metric="global_step")
+        wandb_logger.define_metric("val/fid", summary="min")
+        wandb_logger.define_metric("train/loss", summary="min")
+    else:
+        wandb_logger = None
+
+    # ===================== Resume from artifact =====================
+    start_epoch = 0
+    if args.resume_enabled:
+        start_epoch = _resume_from_wandb_artifact(
+            args, unet_wo_ddp, inference_scheduler, vae_wo_ddp,
+            class_embedder_wo_ddp, optimizer
+        )
+
+    # ===================== FID Reference Stats (lazy init, rank-0 only) =====================
+    ref_mu = None
+    ref_sigma = None
+    if is_primary(args) and args.fid_every_n_epochs > 0:
+        from fid_utils import extract_features_from_tensors, compute_statistics, compute_fid, save_stats_npz, load_stats_npz  # noqa: lazy import
+        ref_stats_path = args.fid_ref_stats_path
+        if ref_stats_path is None:
+            proj_root = os.environ.get("PROJ_ROOT", os.path.dirname(os.path.abspath(__file__)))
+            ref_stats_path = os.path.join(proj_root, "fid_ref_imagenet100_128.npz")
+        if os.path.exists(ref_stats_path):
+            logger.info(f"Loading cached FID reference stats from {ref_stats_path}")
+            ref_mu, ref_sigma = load_stats_npz(ref_stats_path)
+        else:
+            logger.info("Reference FID stats not found - will compute from training data on first FID epoch.")
 
     # ===================== Training Loop =====================
     if is_primary(args):
@@ -453,7 +571,9 @@ def main():
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
 
-    for epoch in range(args.num_epochs):
+    best_fid = float('inf')
+
+    for epoch in range(start_epoch, args.num_epochs):
 
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
@@ -472,7 +592,7 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            # Latent DDPM — encode with frozen VAE
+            # Latent DDPM - encode with frozen VAE
             if vae:
                 with torch.no_grad():
                     images = vae.encode(images)
@@ -533,6 +653,25 @@ def main():
                         )
 
                     loss = F.mse_loss(model_pred, target)
+
+            # ---- NaN/Inf early exit (exit 42 = do not retry) ----
+            if not torch.isfinite(loss):
+                if is_primary(args):
+                    Path(output_dir, "NAN_DETECTED").write_text(
+                        f"epoch={epoch} step={step}\n"
+                    )
+                    try:
+                        wandb_logger.alert(
+                            title="NaN loss",
+                            text=f"exp {args.run_name} died at epoch={epoch} step={step}",
+                        )
+                    except Exception:
+                        pass
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    dist.barrier()
+                sys.exit(42)
+
             loss_m.update(loss.item())
 
             if grad_scaler.is_enabled():
@@ -557,7 +696,11 @@ def main():
                     f"Step {step}/{num_update_steps_per_epoch}, "
                     f"Loss {loss.item():.4f} (avg {loss_m.avg:.4f})"
                 )
-                wandb_logger.log({'loss': loss_m.avg, 'lr': optimizer.param_groups[0]['lr']})
+                wandb_logger.log({
+                    'train/loss': loss_m.avg,
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'global_step': global_step,
+                })
 
         # ===================== Epoch-end: Sample & Save =====================
         ema.apply_shadow(unet_wo_ddp)
@@ -594,19 +737,134 @@ def main():
                 grid_image.paste(image, (i * args.image_size, 0))
 
             if is_primary(args):
-                wandb_logger.log({'gen_images': wandb.Image(grid_image)})
+                wandb_logger.log({
+                    'val/gen_images': wandb.Image(grid_image),
+                    'global_step': global_step,
+                })
 
         ema.restore(unet_wo_ddp)
 
+        # ===================== FID Evaluation (rank-0, every N epochs) =====================
+        val_fid = None
+        if is_primary(args) and args.fid_every_n_epochs > 0 and (epoch + 1) % args.fid_every_n_epochs == 0:
+            logger.info(f"Computing FID at epoch {epoch+1}...")
+            from fid_utils import extract_features_from_tensors, compute_statistics, compute_fid, save_stats_npz, load_stats_npz  # noqa: lazy import
+
+            # Lazily build reference stats from training data if not yet available
+            if ref_mu is None:
+                ref_stats_path = args.fid_ref_stats_path
+                if ref_stats_path is None:
+                    proj_root = os.environ.get('PROJ_ROOT', os.path.dirname(os.path.abspath(__file__)))
+                    ref_stats_path = os.path.join(proj_root, 'fid_ref_imagenet100_128.npz')
+
+                logger.info("Computing reference FID stats from training data (one-time)...")
+                ref_transform_fid = transforms.Compose([
+                    transforms.Resize((args.image_size, args.image_size)),
+                    transforms.ToTensor(),   # [0, 1]
+                ])
+                ref_dataset_fid = datasets.ImageFolder(root=data_dir, transform=ref_transform_fid)
+                # Sample up to fid_num_samples real images
+                n_ref = min(args.fid_num_samples, len(ref_dataset_fid))
+                indices = torch.randperm(len(ref_dataset_fid))[:n_ref].tolist()
+                ref_subset = torch.utils.data.Subset(ref_dataset_fid, indices)
+                ref_loader_fid = torch.utils.data.DataLoader(
+                    ref_subset, batch_size=64, shuffle=False, num_workers=args.num_workers
+                )
+                ref_tensors_list = []
+                for imgs_fid, _ in ref_loader_fid:
+                    ref_tensors_list.append(imgs_fid)
+                ref_tensors_cat = torch.cat(ref_tensors_list, dim=0)  # [N, 3, H, W] in [0,1]
+                ref_features = extract_features_from_tensors(
+                    ref_tensors_cat, device=str(device)
+                )
+                ref_mu, ref_sigma = compute_statistics(ref_features)
+                try:
+                    save_stats_npz(ref_mu, ref_sigma, ref_stats_path)
+                    logger.info(f"Reference FID stats saved to {ref_stats_path}")
+                except Exception as exc:
+                    logger.warning(f"Could not save reference stats: {exc}")
+
+            # Generate samples for FID scoring
+            with evaluation_mode(unet, class_embedder):
+                gen_fid_generator = torch.Generator(device=device)
+                gen_fid_generator.manual_seed(epoch + args.seed + 9999)
+
+                gen_imgs_list = []
+                n_remaining = args.fid_num_samples
+                fid_batch = 50
+                while n_remaining > 0:
+                    cur_batch = min(fid_batch, n_remaining)
+                    if args.use_cfg:
+                        fid_classes = torch.randint(0, args.num_classes, (cur_batch,), device=device)
+                        batch_imgs = pipeline(
+                            batch_size=cur_batch,
+                            num_inference_steps=infer_steps,
+                            classes=fid_classes.tolist(),
+                            guidance_scale=args.cfg_guidance_scale,
+                            generator=gen_fid_generator,
+                            device=device,
+                        )
+                    else:
+                        batch_imgs = pipeline(
+                            batch_size=cur_batch,
+                            num_inference_steps=infer_steps,
+                            generator=gen_fid_generator,
+                            device=device,
+                        )
+                    gen_imgs_list.extend(batch_imgs)
+                    n_remaining -= cur_batch
+
+            # Convert PIL images to float tensor [0, 1]
+            gen_tensors_fid = torch.stack([
+                transforms.ToTensor()(img) for img in gen_imgs_list
+            ])
+            gen_features = extract_features_from_tensors(gen_tensors_fid, device=str(device))
+            gen_mu, gen_sigma = compute_statistics(gen_features)
+            val_fid = compute_fid(ref_mu, ref_sigma, gen_mu, gen_sigma)
+            logger.info(f"Epoch {epoch+1} FID = {val_fid:.4f}")
+            wandb_logger.log({'val/fid': val_fid, 'global_step': global_step})
+
+        # ===================== Checkpoint Save =====================
         if is_primary(args):
-            save_checkpoint(
+            # Atomic latest overwrite every epoch
+            latest_path = save_checkpoint_atomic(
                 unet_wo_ddp, inference_scheduler,
                 vae_wo_ddp, class_embedder_wo_ddp,
-                optimizer, epoch, save_dir=save_dir
+                optimizer, epoch, filename='latest.pth', save_dir=save_dir
             )
+
+            # Best checkpoint: only when FID improves
+            if val_fid is not None and val_fid < best_fid:
+                best_fid = val_fid
+                save_checkpoint_atomic(
+                    unet_wo_ddp, inference_scheduler,
+                    vae_wo_ddp, class_embedder_wo_ddp,
+                    optimizer, epoch, filename='best.pth', save_dir=save_dir
+                )
+                wandb_logger.summary['best_val_fid'] = best_fid
+                wandb_logger.summary['best_epoch'] = epoch
+                logger.info(f"New best checkpoint saved (FID={best_fid:.4f})")
+
+            # EMA checkpoint (unchanged)
             ema_ckpt_path = os.path.join(save_dir, f'ema_checkpoint_epoch_{epoch}.pth')
             torch.save({'ema_shadow': ema.shadow}, ema_ckpt_path)
             logger.info(f"EMA checkpoint saved: {ema_ckpt_path}")
+
+            # Wandb artifact upload every N epochs
+            if (epoch + 1) % args.save_every_n_epochs == 0:
+                try:
+                    art = wandb.Artifact(
+                        f"model-{args.run_name}",
+                        type="model",
+                        metadata={"epoch": epoch, "val_fid": val_fid},
+                    )
+                    art.add_file(latest_path)
+                    is_best = (val_fid is not None and val_fid == best_fid)
+                    aliases = ["latest"] + (["best"] if is_best else [])
+                    wandb_logger.log_artifact(art, aliases=aliases)
+                    art.ttl = timedelta(days=60 if is_best else 3)
+                except Exception as exc:
+                    logger.warning(f"wandb artifact upload failed (non-fatal): {exc}")
 
 
 if __name__ == '__main__':

@@ -47,3 +47,18 @@ dit_decoder_depth: 2
 # solver: 'euler' | 'heun' (flow_matching inference only)
 flow_solver: euler
 num_inference_steps_flow: 10
+
+# --- wandb / resume ---
+wandb_entity: idl-project-mm
+wandb_project: ddpm
+resume_enabled: false
+wandb_resume: allow
+wandb_run_id: null
+wandb_ckpt_run_path: null
+wandb_ckpt_alias: latest
+wandb_ckpt_cache_dir: null
+save_every_n_epochs: 5
+# --- FID evaluation ---
+fid_every_n_epochs: 10
+fid_num_samples: 2048
+fid_ref_stats_path: null

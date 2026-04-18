@@ -1,8 +1,9 @@
 # Exp 19 — DDPM baseline (original recipe)
 slurm:
-  node: v100-32
-  gpus: 4
-  time: "06:00:00"
+  node: h100-80
+  gpus: 8
+  time: "01:00:00"
+  # wall-clock 估算: UNet @ H100 0.02 GPUh/ep, 50ep × 0.02 / 8 × 1.2 = 0.15h → 1h
 
 use_cfg: true
 framework: ddpm

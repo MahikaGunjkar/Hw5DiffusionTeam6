@@ -1,0 +1,20 @@
+# Exp 12 — DiT-L, NO OT, no mask, Euler, NFE 10 (反面教材: 大参数无保护路线)
+# Deepthink Row 12: 证明 DiT-L 不用 OT+AdaMask 时过拟合/OOM 崩溃
+# NOTE: 原表格 500ep, 但 DiT-L 无掩码 ≈ 1.6 GPUh/ep, 500ep/8GPU×1.2 ≈ 120h > 48h 上限
+# 压缩至 200ep, 使用 h100-80 节点加速; 反面教材不需要长期收敛, 200ep 足以暴露问题
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "05:00:00"
+  # wall-clock 估算: DiT-L no_mask @ H100 0.16 GPUh/ep, 200ep × 0.16 / 8 × 1.2 = 4.8h → 5h
+
+framework: flow_matching
+use_ot: false
+use_cfg: true
+model_type: dit_l
+use_ada_mask: false
+num_epochs: 200
+batch_size: 16
+learning_rate: 0.0003
+flow_solver: euler
+num_inference_steps_flow: 10

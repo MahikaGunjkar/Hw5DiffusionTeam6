@@ -11,6 +11,7 @@
 #   scripts/submit.sh 03 06 09         # specific list
 #   scripts/submit.sh --range 01-05    # range expansion
 #   scripts/submit.sh --dry-run 03     # print sbatch command, do not submit
+#   scripts/submit.sh --export-extra WANDB_RUN_ID=exp03-20260418,WANDB_RESUME=must 03
 
 set -euo pipefail
 
@@ -24,6 +25,7 @@ mkdir -p "${LOG_DIR}"
 
 DRY_RUN=0
 IDS=()
+EXTRA_EXPORTS=""
 
 # ── Parse flags ──
 while [[ $# -gt 0 ]]; do
@@ -41,8 +43,12 @@ while [[ $# -gt 0 ]]; do
             done
             shift 2
             ;;
+        --export-extra)
+            EXTRA_EXPORTS=",${2}"
+            shift 2
+            ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,16p' "$0"
             exit 0
             ;;
         *)
@@ -84,6 +90,12 @@ for exp_id in "${IDS[@]}"; do
         continue
     fi
 
+    # preflight 检查（dry-run 下也执行，提前暴露问题）
+    if ! bash "${SCRIPT_DIR}/preflight.sh" "${exp_id}"; then
+        echo "[ABORT] exp ${exp_id}: preflight 失败，中止提交"
+        exit 1
+    fi
+
     node=$(_slurm_field "${yaml_path}" node)
     gpus=$(_slurm_field "${yaml_path}" gpus)
     time=$(_slurm_field "${yaml_path}" time)
@@ -100,7 +112,7 @@ for exp_id in "${IDS[@]}"; do
         --time="${time}"
         --output="${STDOUT}"
         --error="${STDERR}"
-        --export="ALL,EXP_ID=${exp_id},NUM_GPUS=${gpus},BASE_CFG=${BASE_CFG},EXP_CFG=${yaml_path}"
+        --export="ALL,EXP_ID=${exp_id},NUM_GPUS=${gpus},BASE_CFG=${BASE_CFG},EXP_CFG=${yaml_path}${EXTRA_EXPORTS}"
         "${SLURM_TEMPLATE}"
     )
 

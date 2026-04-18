@@ -1,0 +1,19 @@
+# Exp 11 — DiT-B, OT-AdaMask 75%, Heun solver, NFE 4 (极限步数消融: 4步出图挑战)
+# Deepthink Row 11: 极限推理步数，验证 OT 轨迹平直性对超低 NFE 的支撑能力
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "03:00:00"
+  # wall-clock 估算: DiT-B Ada75% @ H100 0.02 GPUh/ep, 800ep × 0.02 / 8 × 1.2 = 2.4h → 3h
+
+framework: flow_matching
+use_ot: true
+use_cfg: true
+model_type: dit_b
+use_ada_mask: true
+ada_mask_max: 0.75
+num_epochs: 800
+batch_size: 32
+learning_rate: 0.0003
+flow_solver: heun
+num_inference_steps_flow: 4
