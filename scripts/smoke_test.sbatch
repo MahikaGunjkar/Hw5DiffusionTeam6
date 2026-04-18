@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ot_smoke
 #SBATCH --partition=GPU-shared
-#SBATCH --gpus=v100-32:1
+#SBATCH --gpus=v100-16:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
 #SBATCH --time=00:45:00
