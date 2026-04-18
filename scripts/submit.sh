@@ -104,8 +104,12 @@ for exp_id in "${IDS[@]}"; do
     STDOUT="${LOG_DIR}/exp${exp_id}_%j.out"
     STDERR="${LOG_DIR}/exp${exp_id}_%j.err"
 
+    # PSC allocation: charge to cis260133p (Diffusion Group 6), NOT user's default cis250019p
+    PSC_ACCOUNT="${PSC_ACCOUNT:-cis260133p}"
+
     CMD=(
         sbatch
+        --account="${PSC_ACCOUNT}"
         --job-name="${JOB_NAME}"
         --gpus="${node}:${gpus}"
         --ntasks-per-node="${gpus}"
