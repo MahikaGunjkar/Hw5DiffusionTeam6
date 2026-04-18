@@ -826,11 +826,14 @@ def main():
 
         # ===================== Checkpoint Save =====================
         if is_primary(args):
+            # EMA shadow is packaged into the main checkpoint (latest/best)
+            # so inference.py can load weights + EMA from a single file.
             # Atomic latest overwrite every epoch
             latest_path = save_checkpoint_atomic(
                 unet_wo_ddp, inference_scheduler,
                 vae_wo_ddp, class_embedder_wo_ddp,
-                optimizer, epoch, filename='latest.pth', save_dir=save_dir
+                optimizer, epoch, ema_shadow=ema.shadow,
+                filename='latest.pth', save_dir=save_dir,
             )
 
             # Best checkpoint: only when FID improves
@@ -839,16 +842,12 @@ def main():
                 save_checkpoint_atomic(
                     unet_wo_ddp, inference_scheduler,
                     vae_wo_ddp, class_embedder_wo_ddp,
-                    optimizer, epoch, filename='best.pth', save_dir=save_dir
+                    optimizer, epoch, ema_shadow=ema.shadow,
+                    filename='best.pth', save_dir=save_dir,
                 )
                 wandb_logger.summary['best_val_fid'] = best_fid
                 wandb_logger.summary['best_epoch'] = epoch
                 logger.info(f"New best checkpoint saved (FID={best_fid:.4f})")
-
-            # EMA checkpoint (unchanged)
-            ema_ckpt_path = os.path.join(save_dir, f'ema_checkpoint_epoch_{epoch}.pth')
-            torch.save({'ema_shadow': ema.shadow}, ema_ckpt_path)
-            logger.info(f"EMA checkpoint saved: {ema_ckpt_path}")
 
             # Wandb artifact upload every N epochs
             if (epoch + 1) % args.save_every_n_epochs == 0:

@@ -64,10 +64,15 @@ def save_checkpoint(unet, scheduler, vae=None, class_embedder=None, optimizer=No
 
 
 def save_checkpoint_atomic(unet, scheduler, vae=None, class_embedder=None, optimizer=None,
-                           epoch=None, filename='latest.pth', save_dir='checkpoints') -> str:
+                           epoch=None, ema_shadow=None, filename='latest.pth',
+                           save_dir='checkpoints') -> str:
     """
     Atomic checkpoint save: write to .tmp, fsync, then rename.
     Prevents partial reads on Lustre / NFS parallel filesystems.
+
+    When ``ema_shadow`` is provided it is packaged into the same checkpoint
+    file under the ``ema_shadow`` key, so inference.py can load weights and
+    EMA shadow from a single file without per-epoch sidecar sprawl.
 
     Returns the path of the final checkpoint file.
     """
@@ -93,6 +98,9 @@ def save_checkpoint_atomic(unet, scheduler, vae=None, class_embedder=None, optim
 
     if epoch is not None:
         checkpoint['epoch'] = epoch
+
+    if ema_shadow is not None:
+        checkpoint['ema_shadow'] = ema_shadow
 
     torch.save(checkpoint, tmp_path)
 

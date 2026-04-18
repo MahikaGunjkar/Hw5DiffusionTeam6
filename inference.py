@@ -147,15 +147,27 @@ def main():
         logger.info("Loading class_embedder")
         class_embedder.load_state_dict(ckpt['class_embedder_state_dict'])
 
-    # Load EMA weights if available
-    ema_ckpt_path = args.ckpt.replace('checkpoint_epoch_', 'ema_checkpoint_epoch_')
-    if os.path.exists(ema_ckpt_path):
-        logger.info(f"Loading EMA weights from {ema_ckpt_path}")
-        ema_data = torch.load(ema_ckpt_path, weights_only=False, map_location="cpu")
+    # Load EMA shadow — new format packages it into the main ckpt under
+    # 'ema_shadow'; legacy format keeps a sibling 'ema_checkpoint_epoch_N.pth'.
+    ema_shadow = None
+    if 'ema_shadow' in ckpt:
+        ema_shadow = ckpt['ema_shadow']
+        logger.info("Loading EMA weights from main checkpoint (new format)")
+    else:
+        # Legacy fallback: derive sibling path by swapping prefix
+        legacy_ema_path = args.ckpt.replace('checkpoint_epoch_', 'ema_checkpoint_epoch_')
+        if legacy_ema_path != args.ckpt and os.path.exists(legacy_ema_path):
+            logger.info(f"Loading EMA weights from legacy sidecar {legacy_ema_path}")
+            ema_data = torch.load(legacy_ema_path, weights_only=False, map_location="cpu")
+            ema_shadow = ema_data.get('ema_shadow')
+
+    if ema_shadow:
         for name, param in unet.named_parameters():
-            if name in ema_data.get('ema_shadow', {}):
-                param.data.copy_(ema_data['ema_shadow'][name].to(device))
-        logger.info("EMA weights loaded")
+            if name in ema_shadow:
+                param.data.copy_(ema_shadow[name].to(device))
+        logger.info("EMA weights applied")
+    else:
+        logger.info("No EMA shadow found; using raw weights")
 
     unet.eval()
 
