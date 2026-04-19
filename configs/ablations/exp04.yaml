@@ -15,3 +15,6 @@ ada_mask_max: 0.75
 num_epochs: 300
 batch_size: 64
 learning_rate: 0.0004
+
+# FID disabled — root cause fixed in bb56af3, kept off until exp15 verifies end-to-end
+fid_every_n_epochs: 0

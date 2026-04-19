@@ -16,3 +16,6 @@ use_cfg: true
 num_epochs: 300
 batch_size: 32
 learning_rate: 3.0e-4
+
+# FID disabled — root cause fixed in bb56af3, kept off until exp15 verifies end-to-end
+fid_every_n_epochs: 0
