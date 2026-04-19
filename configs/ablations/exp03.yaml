@@ -3,8 +3,9 @@
 slurm:
   node: h100-80
   gpus: 8
-  time: "01:00:00"
-  # wall-clock 估算: DiT-B Ada75% @ H100 0.02 GPUh/ep, 300ep × 0.02 / 8 × 1.2 = 0.9h → 1h
+  time: "12:00:00"
+  # wall-clock 估算约 0.9h，但按 exp01 的 Bridges-2 提交模板统一申请 12h
+  # 用户要求 (2026-04-18)：保持 8x H100 + NVLink/NVLS + 12h，降低因模板不一致被卡的风险
 
 framework: flow_matching
 model_type: dit_b

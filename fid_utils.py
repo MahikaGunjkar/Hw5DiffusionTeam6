@@ -142,11 +142,14 @@ def extract_features_from_tensors(images, device='cuda', batch_size=64):
     """
     model = get_inception_model(device)
 
-    # Auto-detect [-1, 1] range and rescale to [0, 1]
-    if images.min() < -0.01:
-        print("Detected [-1, 1] range, rescaling to [0, 1]")
-        images = (images + 1.0) / 2.0
-    images = images.clamp(0.0, 1.0)
+    # torchmetrics' Inception-v3 wrapper requires uint8 [0, 255] input.
+    # Accept float [0,1] or [-1,1]; normalize to [0,1], clamp, then cast to uint8.
+    if images.dtype != torch.uint8:
+        if images.min() < -0.01:
+            print("Detected [-1, 1] range, rescaling to [0, 1]")
+            images = (images + 1.0) / 2.0
+        images = images.clamp(0.0, 1.0)
+        images = (images * 255.0).round().to(torch.uint8)
 
     print(f"Extracting features from {len(images)} image tensors")
     all_features = []
@@ -214,10 +217,13 @@ def compute_fid(mu1, sigma1, mu2, sigma2, eps=1e-6):
 # ============================================================
 
 def save_stats_npz(mu, sigma, filepath):
-    """Save (mu, sigma) to a compressed .npz file."""
+    """Save (mu, sigma) to a compressed .npz file. Returns actual on-disk path (handles numpy auto-suffix)."""
+    if not filepath.endswith(".npz"):
+        filepath += ".npz"
     np.savez_compressed(filepath, mu=mu, sigma=sigma)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     print(f"Saved stats to {filepath} ({size_mb:.1f} MB)")
+    return filepath
 
 
 def load_stats_npz(filepath):

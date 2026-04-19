@@ -59,6 +59,6 @@ wandb_ckpt_alias: latest
 wandb_ckpt_cache_dir: null
 save_every_n_epochs: 5
 # --- FID evaluation ---
-fid_every_n_epochs: 10
+fid_every_n_epochs: 0
 fid_num_samples: 2048
 fid_ref_stats_path: null

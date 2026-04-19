@@ -173,6 +173,11 @@ def parse_args():
                         help="Wandb project name.")
 
     # ---- Resume ----
+    parser.add_argument("--resume_ckpt_path", type=str, default=None,
+                        help="Local Ocean checkpoint (.pth) to resume from. "
+                             "Takes precedence over --resume_enabled. When the path "
+                             "is under an existing experiment dir, that dir is reused "
+                             "instead of spawning exp-N-<run_name>.")
     parser.add_argument("--resume_enabled", type=str2bool, default=False,
                         help="Download artifact from wandb and resume training.")
     parser.add_argument("--wandb_resume", type=str,
@@ -192,7 +197,7 @@ def parse_args():
                         help="Upload wandb artifact every N epochs.")
 
     # ---- FID evaluation ----
-    parser.add_argument("--fid_every_n_epochs", type=int, default=10,
+    parser.add_argument("--fid_every_n_epochs", type=int, default=0,
                         help="Compute FID every N epochs (0 = disabled).")
     parser.add_argument("--fid_num_samples", type=int, default=2048,
                         help="Number of generated samples for FID computation.")
@@ -339,7 +344,23 @@ def main():
     args.total_batch_size = total_batch_size
 
     # ---- Experiment folder ----
-    if args.run_name is None:
+    # Resume precedence: if --resume_ckpt_path points into <output_dir>/<existing_run>/checkpoints/<x>.pth,
+    # reuse the existing exp-N-<run_name> directory. Otherwise allocate a fresh index.
+    reused_run_dir = None
+    if args.resume_ckpt_path:
+        ckpt_p = Path(args.resume_ckpt_path).resolve()
+        out_p = Path(args.output_dir).resolve()
+        try:
+            rel = ckpt_p.relative_to(out_p)
+            # Expect <run_name>/checkpoints/<file>.pth
+            if len(rel.parts) >= 2 and rel.parts[1] == 'checkpoints':
+                reused_run_dir = rel.parts[0]
+        except ValueError:
+            reused_run_dir = None
+
+    if reused_run_dir is not None:
+        args.run_name = reused_run_dir
+    elif args.run_name is None:
         args.run_name = f'exp-{len(os.listdir(args.output_dir))}'
     else:
         args.run_name = f'exp-{len(os.listdir(args.output_dir))}-{args.run_name}'
@@ -536,13 +557,45 @@ def main():
     else:
         wandb_logger = None
 
-    # ===================== Resume from artifact =====================
+    # ===================== Resume (local Ocean ckpt > wandb artifact) =====================
     start_epoch = 0
-    if args.resume_enabled:
+    best_fid = float('inf')
+    resume_state = None
+    if args.resume_ckpt_path:
+        if not os.path.exists(args.resume_ckpt_path):
+            raise FileNotFoundError(f"--resume_ckpt_path not found: {args.resume_ckpt_path}")
+        logger.info(f"Resuming from local checkpoint: {args.resume_ckpt_path}")
+        resume_state = load_checkpoint(
+            unet_wo_ddp, inference_scheduler, vae_wo_ddp,
+            class_embedder_wo_ddp, optimizer,
+            checkpoint_path=args.resume_ckpt_path,
+            lr_scheduler=lr_scheduler,
+            grad_scaler=grad_scaler,
+        )
+        start_epoch = resume_state['epoch'] + 1
+        logger.info(f"Resume start_epoch={start_epoch}")
+    elif args.resume_enabled:
         start_epoch = _resume_from_wandb_artifact(
             args, unet_wo_ddp, inference_scheduler, vae_wo_ddp,
             class_embedder_wo_ddp, optimizer
         )
+
+    # Restore EMA shadow into the live EMA helper and best_fid tracker.
+    if resume_state is not None:
+        if resume_state.get('ema_shadow') is not None:
+            for name, tensor in resume_state['ema_shadow'].items():
+                if name in ema.shadow:
+                    ema.shadow[name] = tensor.to(ema.shadow[name].device)
+            logger.info("EMA shadow restored from checkpoint.")
+        if resume_state.get('best_fid') is not None:
+            best_fid = float(resume_state['best_fid'])
+            logger.info(f"best_fid restored = {best_fid:.4f}")
+        # Legacy ckpts without lr_scheduler: fast-forward via step()
+        if not resume_state.get('has_lr_scheduler') and start_epoch > 0:
+            replay_steps = start_epoch * num_update_steps_per_epoch
+            logger.info(f"Legacy ckpt: advancing lr_scheduler by {replay_steps} steps")
+            for _ in range(replay_steps):
+                lr_scheduler.step()
 
     # ===================== FID Reference Stats (lazy init, rank-0 only) =====================
     ref_mu = None
@@ -570,8 +623,6 @@ def main():
         logger.info(f"  Total steps            = {args.max_train_steps}")
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
-
-    best_fid = float('inf')
 
     for epoch in range(start_epoch, args.num_epochs):
 
@@ -750,39 +801,53 @@ def main():
             logger.info(f"Computing FID at epoch {epoch+1}...")
             from fid_utils import extract_features_from_tensors, compute_statistics, compute_fid, save_stats_npz, load_stats_npz  # noqa: lazy import
 
-            # Lazily build reference stats from training data if not yet available
+            # Lazily build reference stats from training data if not yet available.
+            # exp01-04 may hit this concurrently — use an exclusive file lock so
+            # only one job generates the shared npz and peers load the result.
             if ref_mu is None:
                 ref_stats_path = args.fid_ref_stats_path
                 if ref_stats_path is None:
                     proj_root = os.environ.get('PROJ_ROOT', os.path.dirname(os.path.abspath(__file__)))
                     ref_stats_path = os.path.join(proj_root, 'fid_ref_imagenet100_128.npz')
 
-                logger.info("Computing reference FID stats from training data (one-time)...")
-                ref_transform_fid = transforms.Compose([
-                    transforms.Resize((args.image_size, args.image_size)),
-                    transforms.ToTensor(),   # [0, 1]
-                ])
-                ref_dataset_fid = datasets.ImageFolder(root=data_dir, transform=ref_transform_fid)
-                # Sample up to fid_num_samples real images
-                n_ref = min(args.fid_num_samples, len(ref_dataset_fid))
-                indices = torch.randperm(len(ref_dataset_fid))[:n_ref].tolist()
-                ref_subset = torch.utils.data.Subset(ref_dataset_fid, indices)
-                ref_loader_fid = torch.utils.data.DataLoader(
-                    ref_subset, batch_size=64, shuffle=False, num_workers=args.num_workers
-                )
-                ref_tensors_list = []
-                for imgs_fid, _ in ref_loader_fid:
-                    ref_tensors_list.append(imgs_fid)
-                ref_tensors_cat = torch.cat(ref_tensors_list, dim=0)  # [N, 3, H, W] in [0,1]
-                ref_features = extract_features_from_tensors(
-                    ref_tensors_cat, device=str(device)
-                )
-                ref_mu, ref_sigma = compute_statistics(ref_features)
-                try:
-                    save_stats_npz(ref_mu, ref_sigma, ref_stats_path)
-                    logger.info(f"Reference FID stats saved to {ref_stats_path}")
-                except Exception as exc:
-                    logger.warning(f"Could not save reference stats: {exc}")
+                import fcntl
+                lock_path = ref_stats_path + '.lock'
+                Path(ref_stats_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(lock_path, 'w') as lock_fh:
+                    fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                    try:
+                        if os.path.exists(ref_stats_path):
+                            logger.info(f"FID ref stats exist (built by peer): {ref_stats_path}")
+                            ref_mu, ref_sigma = load_stats_npz(ref_stats_path)
+                        else:
+                            logger.info("Computing reference FID stats (one-time, under lock)...")
+                            ref_transform_fid = transforms.Compose([
+                                transforms.Resize((args.image_size, args.image_size)),
+                                transforms.ToTensor(),   # [0, 1]
+                            ])
+                            ref_dataset_fid = datasets.ImageFolder(root=data_dir, transform=ref_transform_fid)
+                            n_ref = min(args.fid_num_samples, len(ref_dataset_fid))
+                            indices = torch.randperm(len(ref_dataset_fid))[:n_ref].tolist()
+                            ref_subset = torch.utils.data.Subset(ref_dataset_fid, indices)
+                            ref_loader_fid = torch.utils.data.DataLoader(
+                                ref_subset, batch_size=64, shuffle=False,
+                                num_workers=args.num_workers,
+                            )
+                            ref_tensors_list = []
+                            for imgs_fid, _ in ref_loader_fid:
+                                ref_tensors_list.append(imgs_fid)
+                            ref_tensors_cat = torch.cat(ref_tensors_list, dim=0)
+                            ref_features = extract_features_from_tensors(
+                                ref_tensors_cat, device=str(device)
+                            )
+                            ref_mu, ref_sigma = compute_statistics(ref_features)
+                            # Atomic write: tmp + rename so peers never load a partial file.
+                            tmp_stats = ref_stats_path + '.tmp'
+                            tmp_actual = save_stats_npz(ref_mu, ref_sigma, tmp_stats)
+                            os.replace(tmp_actual, ref_stats_path)
+                            logger.info(f"Reference FID stats saved to {ref_stats_path}")
+                    finally:
+                        fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
             # Generate samples for FID scoring
             with evaluation_mode(unet, class_embedder):
@@ -826,44 +891,68 @@ def main():
 
         # ===================== Checkpoint Save =====================
         if is_primary(args):
-            # EMA shadow is packaged into the main checkpoint (latest/best)
-            # so inference.py can load weights + EMA from a single file.
-            # Atomic latest overwrite every epoch
+            # Full training state (optimizer, lr_scheduler, grad_scaler, EMA
+            # shadow, best_fid) so resume is byte-identical-ish, not warm-start.
             latest_path = save_checkpoint_atomic(
                 unet_wo_ddp, inference_scheduler,
                 vae_wo_ddp, class_embedder_wo_ddp,
                 optimizer, epoch, ema_shadow=ema.shadow,
                 filename='latest.pth', save_dir=save_dir,
+                lr_scheduler=lr_scheduler,
+                grad_scaler=grad_scaler,
+                best_fid=best_fid,
             )
 
-            # Best checkpoint: only when FID improves
+            best_path = None
             if val_fid is not None and val_fid < best_fid:
                 best_fid = val_fid
-                save_checkpoint_atomic(
+                best_path = save_checkpoint_atomic(
                     unet_wo_ddp, inference_scheduler,
                     vae_wo_ddp, class_embedder_wo_ddp,
                     optimizer, epoch, ema_shadow=ema.shadow,
                     filename='best.pth', save_dir=save_dir,
+                    lr_scheduler=lr_scheduler,
+                    grad_scaler=grad_scaler,
+                    best_fid=best_fid,
                 )
                 wandb_logger.summary['best_val_fid'] = best_fid
                 wandb_logger.summary['best_epoch'] = epoch
                 logger.info(f"New best checkpoint saved (FID={best_fid:.4f})")
 
-            # Wandb artifact upload every N epochs
+            # W&B artifact: log as file:// reference (no byte upload). Ocean
+            # remains source of truth; W&B only tracks versioned metadata.
             if (epoch + 1) % args.save_every_n_epochs == 0:
                 try:
+                    latest_abs = os.path.abspath(latest_path)
                     art = wandb.Artifact(
                         f"model-{args.run_name}",
                         type="model",
-                        metadata={"epoch": epoch, "val_fid": val_fid},
+                        metadata={
+                            "epoch": epoch,
+                            "val_fid": val_fid,
+                            "best_fid": best_fid,
+                            "ocean_path": latest_abs,
+                            "run_name": args.run_name,
+                        },
                     )
-                    art.add_file(latest_path)
-                    is_best = (val_fid is not None and val_fid == best_fid)
+                    art.add_reference(f"file://{latest_abs}", checksum=True)
+                    is_best = (best_path is not None)
                     aliases = ["latest"] + (["best"] if is_best else [])
                     wandb_logger.log_artifact(art, aliases=aliases)
                     art.ttl = timedelta(days=60 if is_best else 3)
+                    if is_best:
+                        best_abs = os.path.abspath(best_path)
+                        art_best = wandb.Artifact(
+                            f"model-{args.run_name}-best",
+                            type="model",
+                            metadata={"epoch": epoch, "val_fid": val_fid,
+                                      "ocean_path": best_abs, "run_name": args.run_name},
+                        )
+                        art_best.add_reference(f"file://{best_abs}", checksum=True)
+                        wandb_logger.log_artifact(art_best, aliases=["best"])
+                        art_best.ttl = timedelta(days=60)
                 except Exception as exc:
-                    logger.warning(f"wandb artifact upload failed (non-fatal): {exc}")
+                    logger.warning(f"wandb artifact reference logging failed (non-fatal): {exc}")
 
 
 if __name__ == '__main__':

@@ -58,6 +58,21 @@ cd "${REPO_DIR:-$(pwd)}"
 : "${WANDB_RUN_ID:=exp${EXP_ID}-$(date +%Y%m%d)}"
 export WANDB_RUN_ID
 
+# Auto-resume: if exactly one prior run dir has latest.pth, resume from it.
+RESUME_ARGS=()
+EXP_OUT="${OUTPUT_DIR}/exp${EXP_ID}"
+if [ -d "${EXP_OUT}" ]; then
+    mapfile -t LATEST_CANDS < <(find "${EXP_OUT}" -maxdepth 3 -type f -name latest.pth 2>/dev/null)
+    if [ "${#LATEST_CANDS[@]}" -eq 1 ]; then
+        echo "Auto-resume: ${LATEST_CANDS[0]}"
+        RESUME_ARGS+=(--resume_ckpt_path "${LATEST_CANDS[0]}")
+    elif [ "${#LATEST_CANDS[@]}" -gt 1 ]; then
+        echo "FATAL: multiple latest.pth found under ${EXP_OUT} — refusing ambiguous resume:" >&2
+        printf '  %s\n' "${LATEST_CANDS[@]}" >&2
+        exit 2
+    fi
+fi
+
 # Launch — `--config BASE EXP` means EXP overrides BASE field-wise.
 torchrun \
     --nproc_per_node=${NUM_GPUS} \
@@ -68,13 +83,14 @@ torchrun \
     --tar_path "${DATA_TAR}" \
     --extract_dir "${EXTRACT_DIR}" \
     --run_name "exp${EXP_ID}" \
-    --output_dir "${OUTPUT_DIR}/exp${EXP_ID}" \
+    --output_dir "${EXP_OUT}" \
     --wandb_entity "${WANDB_ENTITY}" \
     --wandb_project "${WANDB_PROJECT}" \
     --wandb_run_id "${WANDB_RUN_ID}" \
     --wandb_resume "${WANDB_RESUME}" \
     --num_workers 8 \
-    --save_every_n_epochs 5
+    --save_every_n_epochs 5 \
+    "${RESUME_ARGS[@]}"
 EXIT_CODE=$?
 
 # 失败留痕：分 3 档处理退出码

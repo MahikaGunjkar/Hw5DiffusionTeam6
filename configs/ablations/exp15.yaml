@@ -1,9 +1,9 @@
 # Exp 15 — RF + OT on UNet (RF gain without DiT)
 slurm:
   node: h100-80
-  gpus: 8
-  time: "01:00:00"
-  # wall-clock 估算: UNet @ H100 0.02 GPUh/ep, 50ep × 0.02 / 8 × 1.2 = 0.15h → 1h
+  gpus: 3
+  time: "04:00:00"
+  # 3× H100, 4h walltime — UNet @ H100 0.02 GPUh/ep × 50ep / 3 GPU ≈ 0.35h train + VAE eval 余量
 
 framework: flow_matching
 use_cfg: true
