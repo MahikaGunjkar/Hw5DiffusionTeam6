@@ -56,3 +56,10 @@ if [ -f "$PSC_CONDA_BASE/etc/profile.d/conda.sh" ] && [ -d "$PSC_CONDA_ENV" ]; t
     source "$PSC_CONDA_BASE/etc/profile.d/conda.sh"
     conda activate "$PSC_CONDA_ENV"
 fi
+
+# ——— NCCL watchdog hardening (multi-GPU 训练必加) ———
+# 一个 rank 抛异常 → 全部 rank 同步 abort，避免某一个 rank 死锁拖垮整节点
+# (默认行为是只挂掉一个 rank，其他 rank 在 all_reduce 上无限等待，浪费 GPU 小时)
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+# Watchdog 触发时 dump 最近 NCCL ops 的 ring buffer，方便事后定位是哪个 collective 卡的
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
