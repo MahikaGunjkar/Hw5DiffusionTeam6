@@ -19,9 +19,11 @@
 #SBATCH --cpus-per-task=5
 
 set -euo pipefail
+# Hardcoded absolute path — DO NOT rely on SLURM_SUBMIT_DIR (it points
+# to wherever the user ran sbatch, which may not be the repo).
 # $0 / BASH_SOURCE points to /var/spool/slurm/... after SLURM copies the
-# script. Use SLURM_SUBMIT_DIR (set by sbatch) to find env_ocean.sh.
-REPO_ROOT="${SLURM_SUBMIT_DIR:-/ocean/projects/cis260133p/zjiang9/Hw5DiffusionTeam6}"
+# script, so neither dirname-of-source nor SLURM_SUBMIT_DIR is reliable.
+REPO_ROOT="/ocean/projects/cis260133p/zjiang9/Hw5DiffusionTeam6"
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/env_ocean.sh"
 cd "${REPO_DIR}"
