@@ -105,6 +105,88 @@ bash scripts/infer_sweep.sh outputs/exp-XX-exp15/checkpoints/checkpoint_epoch_19
 `train.py`, so the sweep inherits the original `use_cfg`, scheduler, latent,
 and architecture settings instead of silently rebuilding from the base config.
 
+## Kaggle Submission SOP (per training experiment)
+
+`scripts/infer.sbatch` wraps `python inference.py` (README §6) as a SLURM
+batch job. It generates 5,000 images, computes local FID/IS, and writes
+`submission.csv` ready for Kaggle upload (`11685s26-diffusion`).
+
+### When training is RUNNING — pre-queue the inference
+
+```bash
+# Pre-queue inference: starts only when training job exits 0; auto-cancels on fail
+EXP_ID=15  TRAIN_JOB=40044869   # replace with your real ids
+sbatch --account=cis260133p --gpus=h100-80:1 --job-name=infer_exp${EXP_ID} \
+       --output=logs/infer_exp${EXP_ID}_%j.out \
+       --error=logs/infer_exp${EXP_ID}_%j.err \
+       --dependency=afterok:${TRAIN_JOB} \
+       --export=ALL,EXP_ID=${EXP_ID} scripts/infer.sbatch
+```
+
+Batch-queue all four DiT ablations against their training jobs:
+```bash
+declare -A J=([01]=40035557 [02]=40035558 [03]=40035578 [04]=40035528)
+for ID in "${!J[@]}"; do
+  sbatch --account=cis260133p --gpus=h100-80:1 --job-name=infer_exp${ID} \
+         --output=logs/infer_exp${ID}_%j.out \
+         --error=logs/infer_exp${ID}_%j.err \
+         --dependency=afterok:${J[$ID]} \
+         --export=ALL,EXP_ID=${ID} scripts/infer.sbatch
+done
+```
+
+### When training is already DONE — submit immediately
+
+```bash
+EXP_ID=15
+sbatch --account=cis260133p --gpus=h100-80:1 --job-name=infer_exp${EXP_ID} \
+       --output=logs/infer_exp${EXP_ID}_%j.out \
+       --error=logs/infer_exp${EXP_ID}_%j.err \
+       --export=ALL,EXP_ID=${EXP_ID} scripts/infer.sbatch
+```
+
+### What infer.sbatch produces
+
+`/ocean/projects/cis260133p/zjiang9/inference/exp${EXP_ID}_${SLURM_JOB_ID}/`
+- `generated_images/` — 5,000 PNG (50 per class × 100 classes when `use_cfg=true`)
+- `submission.csv` — Inception-v3 mu/sigma stats; upload to Kaggle
+
+Resource: 1× H100 GPU-shared, 1.5h walltime (typical 5-15 min runtime).
+
+### Override hooks (export via `--export=`)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `EXP_ID` | (required) | Exp number, picks `configs/ablations/expNN.yaml` |
+| `CKPT` | `${PROJ_ROOT}/outputs/expNN/exp-0-expNN/checkpoints/latest.pth` | Override ckpt path |
+| `DATA_REF` | `${PROJ_ROOT}/imagenet100_extracted/imagenet100_128x128` | FID reference dir |
+| `EXTRA_ARGS` | (empty) | Extra CLI flags for `inference.py`, e.g. `--cfg_guidance_scale 4.5` |
+
+### Kaggle upload (from local laptop, after `scp` of submission.csv)
+
+```bash
+# Pull from PSC DTN to local
+scp -i ~/.ssh/bridges2-key \
+  "zjiang9@data.bridges2.psc.edu:/ocean/projects/cis260133p/zjiang9/inference/expNN_<jobid>/submission.csv" \
+  ~/Desktop/Hw5DiffusionTeam6/submission_expNN.csv
+
+# Submit (5/day quota — see https://www.kaggle.com/competitions/11685s26-diffusion/submit)
+kaggle competitions submit -c 11685s26-diffusion \
+  -f ~/Desktop/Hw5DiffusionTeam6/submission_expNN.csv \
+  -m "expNN: <model> <framework> <epochs> ep, NFE=10"
+
+# Check leaderboard delta
+kaggle competitions submissions 11685s26-diffusion
+```
+
+Kaggle CLI requires `~/.kaggle/kaggle.json` (legacy `{"username","key"}`
+format). Stored in GCP Secret Manager as `kaggle-json-legacy`:
+```bash
+gcloud secrets versions access latest --secret=kaggle-json-legacy \
+  --project=general-secrets-store > ~/.kaggle/kaggle.json
+chmod 600 ~/.kaggle/kaggle.json
+```
+
 ## NVLink verification
 
 ```bash
