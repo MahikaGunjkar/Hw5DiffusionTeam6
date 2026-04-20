@@ -18,6 +18,7 @@ wandb/
 *.zip
 generated_images/
 submission.csv
+ablation.md
 .env
 .env.*
 !.env.example
