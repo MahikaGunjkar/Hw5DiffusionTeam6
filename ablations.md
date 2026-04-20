@@ -6,10 +6,10 @@
 
 | Exp | File | framework | model_type | use_ot | use_cfg | use_ada_mask | ada_mask_max | const_mask_ratio | dit_decoder_depth | num_epochs | batch_size | learning_rate |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| exp01 | `configs/ablations/exp01.yaml` | `flow_matching` | `dit_xl` | `true` | `true` | `true` | `0.75` | `-` | `-` | `400` | `16` | `0.0003` |
-| exp02 | `configs/ablations/exp02.yaml` | `flow_matching` | `dit_l` | `true` | `true` | `true` | `0.75` | `-` | `-` | `200` | `24` | `0.0003` |
-| exp03 | `configs/ablations/exp03.yaml` | `flow_matching` | `dit_b` | `true` | `true` | `true` | `0.75` | `-` | `-` | `300` | `32` | `0.0003` |
-| exp04 | `configs/ablations/exp04.yaml` | `flow_matching` | `dit_s` | `true` | `true` | `true` | `0.75` | `-` | `-` | `300` | `64` | `0.0004` |
+| exp01 | `configs/ablations/exp01.yaml` | `flow_matching` | `dit_xl` | `true` | `true` | `true` | `0.75` | `-` | `-` | `800` | `16` | `0.0003` |
+| exp02 | `configs/ablations/exp02.yaml` | `flow_matching` | `dit_l` | `true` | `true` | `true` | `0.75` | `-` | `-` | `1100` | `24` | `0.0003` |
+| exp03 | `configs/ablations/exp03.yaml` | `flow_matching` | `dit_b` | `true` | `true` | `true` | `0.75` | `-` | `-` | `3000` | `32` | `0.0003` |
+| exp04 | `configs/ablations/exp04.yaml` | `flow_matching` | `dit_s` | `true` | `true` | `true` | `0.75` | `-` | `-` | `3500` | `64` | `0.0004` |
 | exp05 | `configs/ablations/exp05.yaml` | `flow_matching` | `dit_b` | `true` | `true` | `-` | `-` | `0.5` | `-` | `300` | `32` | `0.0003` |
 | exp06 | `configs/ablations/exp06.yaml` | `flow_matching` | `dit_b` | `true` | `true` | `true` | `0.5` | `-` | `-` | `300` | `32` | `0.0003` |
 | exp07 | `configs/ablations/exp07.yaml` | `flow_matching` | `dit_b` | `true` | `true` | `true` | `0.9` | `-` | `-` | `300` | `32` | `0.0003` |

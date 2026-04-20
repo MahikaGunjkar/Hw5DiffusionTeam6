@@ -13,7 +13,7 @@ use_ot: true
 use_ada_mask: true
 ada_mask_max: 0.75
 use_cfg: true
-num_epochs: 300
+num_epochs: 3000
 batch_size: 32
 learning_rate: 3.0e-4
 

@@ -12,7 +12,7 @@ use_cfg: true
 model_type: dit_l
 use_ada_mask: true
 ada_mask_max: 0.75
-num_epochs: 200
+num_epochs: 1100
 batch_size: 24
 learning_rate: 0.0003
 
