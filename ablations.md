@@ -51,3 +51,15 @@
 | exp18 | `h100-80` | `8` | `05:00:00` | `heun` | `10` |
 | exp19 | `h100-80` | `8` | `01:00:00` | `-` | `-` |
 | exp20 | `h100-80` | `8` | `01:00:00` | `-` | `-` |
+
+## Ablation matrix appendix (added 2026-04-22)
+
+### dit_xl 2x2 ablation cells (all 400ep, H100x4 GPU-shared)
+
+| Exp | use_ot | use_ada_mask | num_epochs | batch_size | hardware | purpose |
+| --- | --- | --- | --- | --- | --- | --- |
+| exp21 | `false` | `false` | `400` | `8` | H100x4 GPU-shared | Baseline (matrix bottom-left) |
+| exp22 | `true` | `false` | `400` | `8` | H100x4 GPU-shared | OT only (matrix top-right) |
+| exp23 | `false` | `true (0.75)` | `400` | `16` | H100x4 GPU-shared | AdaMask only (matrix bottom-right) |
+| exp01 | `true` | `true (0.75)` | `400 (target)` | `16` | H100x8 (existing) | OT+AdaMask (matrix top-left) |
+

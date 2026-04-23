@@ -28,6 +28,9 @@ REPO_ROOT="/ocean/projects/cis260133p/zjiang9/Hw5DiffusionTeam6"
 source "${REPO_ROOT}/scripts/env_ocean.sh"
 cd "${REPO_DIR}"
 
+# CUDA runtime — must come AFTER conda activate so bundled torch libs prioritize, but module load injects driver stub LD path for is_available() to return True
+module load cuda/12.6.1 2>/dev/null || true
+
 EXP_ID="${EXP_ID:?must export EXP_ID, e.g. 15}"
 CKPT="${CKPT:-${PROJ_ROOT}/outputs/exp${EXP_ID}/exp-0-exp${EXP_ID}/checkpoints/latest.pth}"
 DATA_REF="${DATA_REF:-${PROJ_ROOT}/imagenet100_extracted/imagenet100_128x128}"

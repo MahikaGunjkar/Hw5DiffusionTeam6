@@ -1,0 +1,21 @@
+# Exp 21 — DiT-XL Baseline (no OT, no AdaMask) — 400ep ablation cell
+# 2x2 ablation 矩阵：bottom-left。配套 exp01 (OT+AdaMask) / exp22 (OT only) / exp23 (AdaMask only)。
+# Hardware: H100 x 4 GPU-shared，避开 exp01 的 8-card 整节点请求。
+slurm:
+  node: h100-80
+  gpus: 4
+  time: "12:00:00"
+  # wall-clock 估算: DiT-XL no_mask 参考 exp17, 0.48 GPUh/ep
+  # 400ep × 0.48 / 4 GPU × 1.2 = ~58h → 5 chained 12h jobs (auto-resume)
+
+framework: flow_matching
+use_ot: false
+use_cfg: true
+model_type: dit_xl
+use_ada_mask: false
+num_epochs: 400
+batch_size: 8
+learning_rate: 0.0003
+
+# 中途 FID 关闭 — 兜底防御 (exp03 10ep 崩溃 lesson, 即使根因不是 eval)
+fid_every_n_epochs: 0

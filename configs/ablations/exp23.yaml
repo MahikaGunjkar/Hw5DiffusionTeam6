@@ -1,0 +1,21 @@
+# Exp 23 — DiT-XL AdaMask only (no OT) — 400ep ablation cell
+# 2x2 ablation 矩阵：bottom-right。配套 exp01 (OT+AdaMask) / exp21 (baseline) / exp22 (OT only)。
+# Hardware: H100 x 4 GPU-shared。AdaMask 75% mask 大幅降算力，单实验最快。
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "12:00:00"
+  # wall-clock 估算: DiT-XL Ada75% 参考 exp01, ≈ 0.15 GPUh/ep
+  # 400ep × 0.15 / 4 × 1.2 = ~18h → 2 chained 12h jobs
+
+framework: flow_matching
+use_ot: false
+use_cfg: true
+model_type: dit_xl
+use_ada_mask: true
+ada_mask_max: 0.75
+num_epochs: 400
+batch_size: 16
+learning_rate: 0.0003
+
+fid_every_n_epochs: 0
