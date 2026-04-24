@@ -36,6 +36,23 @@ export CKPT_DIR=$PROJ_ROOT/checkpoints
 export OUTPUT_DIR=$PROJ_ROOT/outputs
 export TMPDIR=$PROJ_ROOT/tmp
 
+# ——— Pending Slurm job runtime overrides（2026-04-23）———
+# Used only for already-queued jobs that must not be cancelled before deadline.
+case "${SLURM_JOB_ID:-}" in
+    40151101)
+        export WANDB_RESUME=never
+        echo "NOTICE: job 40151101 starts exp22 from scratch (WANDB_RESUME=never)."
+        ;;
+    40151103)
+        export EXP_ID=21
+        export NUM_GPUS=8
+        export EXP_CFG="$REPO_DIR/configs/ablations/exp21_8gpu.yaml"
+        export WANDB_RESUME=never
+        export WANDB_RUN_ID=exp21-40151103
+        echo "NOTICE: job 40151103 keeps Slurm name/log prefix exp23, but train.py will run exp21 on 8 GPUs from scratch."
+        ;;
+esac
+
 # ——— 幂等 mkdir（不存在才创建，不报错）———
 mkdir -p \
     "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR" \

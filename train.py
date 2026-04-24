@@ -797,7 +797,8 @@ def main():
 
         # ===================== FID Evaluation (rank-0, every N epochs) =====================
         val_fid = None
-        if is_primary(args) and args.fid_every_n_epochs > 0 and (epoch + 1) % args.fid_every_n_epochs == 0:
+        fid_due = args.fid_every_n_epochs > 0 and (epoch + 1) % args.fid_every_n_epochs == 0
+        if is_primary(args) and fid_due:
             logger.info(f"Computing FID at epoch {epoch+1}...")
             from fid_utils import extract_features_from_tensors, compute_statistics, compute_fid, save_stats_npz, load_stats_npz  # noqa: lazy import
 
@@ -849,35 +850,49 @@ def main():
                     finally:
                         fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
-            # Generate samples for FID scoring
-            with evaluation_mode(unet, class_embedder):
-                gen_fid_generator = torch.Generator(device=device)
-                gen_fid_generator.manual_seed(epoch + args.seed + 9999)
+            # Match submission-time inference: score EMA weights and use an
+            # even class schedule instead of random labels for CFG models.
+            ema.apply_shadow(unet_wo_ddp)
+            try:
+                with evaluation_mode(unet, class_embedder):
+                    gen_fid_generator = torch.Generator(device=device)
+                    gen_fid_generator.manual_seed(epoch + args.seed + 9999)
 
-                gen_imgs_list = []
-                n_remaining = args.fid_num_samples
-                fid_batch = 50
-                while n_remaining > 0:
-                    cur_batch = min(fid_batch, n_remaining)
-                    if args.use_cfg:
-                        fid_classes = torch.randint(0, args.num_classes, (cur_batch,), device=device)
-                        batch_imgs = pipeline(
-                            batch_size=cur_batch,
-                            num_inference_steps=infer_steps,
-                            classes=fid_classes.tolist(),
-                            guidance_scale=args.cfg_guidance_scale,
-                            generator=gen_fid_generator,
-                            device=device,
-                        )
-                    else:
-                        batch_imgs = pipeline(
-                            batch_size=cur_batch,
-                            num_inference_steps=infer_steps,
-                            generator=gen_fid_generator,
-                            device=device,
-                        )
-                    gen_imgs_list.extend(batch_imgs)
-                    n_remaining -= cur_batch
+                    gen_imgs_list = []
+                    n_remaining = args.fid_num_samples
+                    fid_batch = 50
+                    fid_label_offset = 0
+                    while n_remaining > 0:
+                        cur_batch = min(fid_batch, n_remaining)
+                        if args.use_cfg:
+                            fid_classes = (
+                                torch.arange(
+                                    fid_label_offset,
+                                    fid_label_offset + cur_batch,
+                                    device=device,
+                                )
+                                % args.num_classes
+                            )
+                            fid_label_offset += cur_batch
+                            batch_imgs = pipeline(
+                                batch_size=cur_batch,
+                                num_inference_steps=infer_steps,
+                                classes=fid_classes.tolist(),
+                                guidance_scale=args.cfg_guidance_scale,
+                                generator=gen_fid_generator,
+                                device=device,
+                            )
+                        else:
+                            batch_imgs = pipeline(
+                                batch_size=cur_batch,
+                                num_inference_steps=infer_steps,
+                                generator=gen_fid_generator,
+                                device=device,
+                            )
+                        gen_imgs_list.extend(batch_imgs)
+                        n_remaining -= cur_batch
+            finally:
+                ema.restore(unet_wo_ddp)
 
             # Convert PIL images to float tensor [0, 1]
             gen_tensors_fid = torch.stack([
@@ -888,6 +903,9 @@ def main():
             val_fid = compute_fid(ref_mu, ref_sigma, gen_mu, gen_sigma)
             logger.info(f"Epoch {epoch+1} FID = {val_fid:.4f}")
             wandb_logger.log({'val/fid': val_fid, 'global_step': global_step})
+
+        if fid_due and args.distributed and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         # ===================== Checkpoint Save =====================
         if is_primary(args):

@@ -21,4 +21,15 @@ submission.csv
 ablation.md
 .env
 .env.*
+HW5_Diffusion_paper/
+# Tool-generated skill mirrors / local agent metadata
+.agents/
+.claude/
+.codex/
+.gemini/
+.hermes/
+.opencode/
+.qwen/
+skills/
+.orchestra-skills.json
 !.env.example

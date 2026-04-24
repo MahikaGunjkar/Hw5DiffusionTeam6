@@ -1,0 +1,21 @@
+# Exp 21 — DiT-XL Baseline (no OT, no AdaMask) — 8-GPU override
+# Runtime target for pending Slurm job 40151103.
+# Purpose: reuse an already-queued 8xH100 job without cancelling it.
+# Slurm metadata for 40151103 remains exp23, but train.py should run exp21.
+slurm:
+  node: h100-80
+  gpus: 8
+  time: "24:00:00"
+
+framework: flow_matching
+use_ot: false
+use_cfg: true
+model_type: dit_xl
+use_ada_mask: false
+num_epochs: 400
+batch_size: 8
+learning_rate: 0.0003
+
+# Validation FID drives best.pth checkpoint selection.
+fid_every_n_epochs: 20
+fid_num_samples: 2048

@@ -138,7 +138,16 @@ def main():
     logger.info("Loading checkpoint")
     ckpt = torch.load(args.ckpt, weights_only=False, map_location="cpu")
     logger.info("Loading unet")
-    unet.load_state_dict(ckpt['unet_state_dict'])
+    # strict=False: exp with use_ada_mask=True saves a trainable `mask_token`
+    # parameter, but inference builds the model with use_ada_mask=False
+    # (inference.py:65) which registers mask_token as a non-persistent buffer
+    # instead. The mask_token is never read at sampling time (self.use_ada_mask
+    # is False -> _unmask() is not called), so silently dropping it is safe.
+    missing, unexpected = unet.load_state_dict(ckpt['unet_state_dict'], strict=False)
+    if unexpected:
+        logger.info(f"Ignored {len(unexpected)} unexpected keys (e.g. mask_token): {unexpected[:3]}")
+    if missing:
+        logger.warning(f"Missing {len(missing)} keys from ckpt: {missing[:5]}")
     logger.info("Skipping scheduler (rebuilt from args)")
     if vae is not None and 'vae_state_dict' in ckpt:
         logger.info("Loading vae")

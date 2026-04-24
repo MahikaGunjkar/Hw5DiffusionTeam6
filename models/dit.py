@@ -214,6 +214,11 @@ class AsymmetricMaskedDiT(nn.Module):
         self.ada_mask_max = ada_mask_max
         self.const_mask_ratio = const_mask_ratio
         self.num_train_timesteps_ref = int(num_train_timesteps_ref)
+        self._trainable_mask_token_enabled = bool(
+            self.use_ada_mask or (
+                self.const_mask_ratio is not None and self.const_mask_ratio > 0
+            )
+        )
 
         c_dim = c_dim if c_dim is not None else hidden_size
         self.c_proj = (
@@ -229,7 +234,16 @@ class AsymmetricMaskedDiT(nn.Module):
         # persistent=False: pos_embed is deterministic from grid_size, no need to save in ckpt
         self.register_buffer("pos_embed", pos_embed.unsqueeze(0), persistent=False)  # (1, N, D)
 
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        if self._trainable_mask_token_enabled:
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        else:
+            # No-mask DiT never calls _unmask(), so keeping mask_token as a
+            # non-trainable buffer avoids DDP unused-parameter failures.
+            self.register_buffer(
+                "mask_token",
+                torch.zeros(1, 1, hidden_size),
+                persistent=False,
+            )
 
         self.encoder_blocks = nn.ModuleList(
             [DiTBlock(hidden_size, num_heads, mlp_ratio) for _ in range(encoder_depth)]

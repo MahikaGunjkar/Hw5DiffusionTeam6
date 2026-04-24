@@ -16,5 +16,6 @@ num_epochs: 800
 batch_size: 16
 learning_rate: 0.0003
 
-# FID disabled — root cause fixed in bb56af3, kept off until exp15 verifies end-to-end
-fid_every_n_epochs: 0
+# Validation FID drives best.pth checkpoint selection.
+fid_every_n_epochs: 20
+fid_num_samples: 2048
